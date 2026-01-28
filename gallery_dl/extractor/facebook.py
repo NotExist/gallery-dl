@@ -91,11 +91,13 @@ class FacebookExtractor(Extractor):
             "id": text.extr(
                 photo_page, '"__isNode":"Photo","id":"', '"'
             ),
-            "set_id": text.extr(
+            "set_id": (
+                lambda u: u.rsplit("&set=", 1)[1] if "&set=" in u else ""
+            )(text.extr(
                 photo_page,
                 '"url":"https:\\/\\/www.facebook.com\\/photo\\/?fbid=',
                 '"'
-            ).rsplit("&set=", 1)[-1],
+            )),
             "username": self.decode_all(text.extr(
                 photo_page, '"owner":{"__typename":"User","name":"', '"'
             )),
@@ -403,10 +405,19 @@ class FacebookPhotoExtractor(FacebookExtractor):
         photo = self.parse_photo_page(photo_page)
         photo["num"] = i
 
-        set_url = f"{self.root}/media/set/?set={photo['set_id']}"
-        set_page = self.request(set_url).text
-
-        directory = self.parse_set_page(set_page)
+        if photo["set_id"]:
+            set_url = f"{self.root}/media/set/?set={photo['set_id']}"
+            set_page = self.request(set_url).text
+            directory = self.parse_set_page(set_page)
+        else:
+            directory = {
+                "set_id": "",
+                "username": photo.get("username", ""),
+                "user_id": photo.get("user_id", ""),
+                "user_pfbid": photo.get("user_pfbid", ""),
+                "title": "",
+                "first_photo_id": photo_id,
+            }
 
         yield Message.Directory, "", directory
         yield Message.Url, photo["url"], photo
@@ -554,9 +565,19 @@ class FacebookAvatarExtractor(FacebookExtractor):
         avatar["count"] = avatar["num"] = 1
         avatar["type"] = "avatar"
 
-        set_url = f"{self.root}/media/set/?set={avatar['set_id']}"
-        set_page = self.request(set_url).text
-        directory = self.parse_set_page(set_page)
+        if avatar["set_id"]:
+            set_url = f"{self.root}/media/set/?set={avatar['set_id']}"
+            set_page = self.request(set_url).text
+            directory = self.parse_set_page(set_page)
+        else:
+            directory = {
+                "set_id": "",
+                "username": avatar.get("username", ""),
+                "user_id": avatar.get("user_id", ""),
+                "user_pfbid": avatar.get("user_pfbid", ""),
+                "title": "",
+                "first_photo_id": avatar.get("id", ""),
+            }
 
         yield Message.Directory, "", directory
         yield Message.Url, avatar["url"], avatar
