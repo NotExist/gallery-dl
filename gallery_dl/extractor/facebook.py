@@ -87,17 +87,24 @@ class FacebookExtractor(Extractor):
         return directory
 
     def parse_photo_page(self, photo_page):
-        photo = {
-            "id": text.extr(
-                photo_page, '"__isNode":"Photo","id":"', '"'
-            ),
-            "set_id": (
-                lambda u: u.rsplit("&set=", 1)[1] if "&set=" in u else ""
-            )(text.extr(
+        photo_id = text.extr(
+            photo_page, '"__isNode":"Photo","id":"', '"'
+        )
+
+        # Extract set_id using photo_id to find the correct URL
+        set_id = ""
+        if photo_id:
+            url_with_id = text.extr(
                 photo_page,
-                '"url":"https:\\/\\/www.facebook.com\\/photo\\/?fbid=',
+                f'"url":"https:\\/\\/www.facebook.com\\/photo\\/?fbid={photo_id}',
                 '"'
-            )),
+            )
+            if "&set=" in url_with_id:
+                set_id = url_with_id.rsplit("&set=", 1)[1]
+
+        photo = {
+            "id": photo_id,
+            "set_id": set_id,
             "username": self.decode_all(text.extr(
                 photo_page, '"owner":{"__typename":"User","name":"', '"'
             )),
@@ -401,28 +408,26 @@ class FacebookPhotoExtractor(FacebookExtractor):
         photo_url = f"{self.root}/photo/?fbid={photo_id}&set="
         photo_page = self.photo_page_request_wrapper(photo_url).text
 
-        i = 1
         photo = self.parse_photo_page(photo_page)
-        photo["num"] = i
+        photo["num"] = 1
 
-        if photo["set_id"]:
-            set_url = f"{self.root}/media/set/?set={photo['set_id']}"
-            set_page = self.request(set_url).text
-            directory = self.parse_set_page(set_page)
-        else:
-            directory = {
-                "set_id": "",
-                "username": photo.get("username", ""),
-                "user_id": photo.get("user_id", ""),
-                "user_pfbid": photo.get("user_pfbid", ""),
-                "title": "",
-                "first_photo_id": photo_id,
-            }
+        # Build directory from photo metadata directly
+        # Do not request the set page as set_id extraction is unreliable
+        # and single photos belong to user's general upload album
+        directory = {
+            "set_id": photo.get("set_id", ""),
+            "username": photo.get("username", ""),
+            "user_id": photo.get("user_id", ""),
+            "user_pfbid": photo.get("user_pfbid", ""),
+            "title": "",
+            "first_photo_id": photo_id,
+        }
 
         yield Message.Directory, "", directory
         yield Message.Url, photo["url"], photo
 
         if self.author_followups:
+            i = 1
             for comment_photo_id in photo["followups_ids"]:
                 comment_photo = self.parse_photo_page(
                     self.photo_page_request_wrapper(
