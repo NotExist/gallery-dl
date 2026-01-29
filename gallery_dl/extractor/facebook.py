@@ -411,17 +411,23 @@ class FacebookPhotoExtractor(FacebookExtractor):
         photo = self.parse_photo_page(photo_page)
         photo["num"] = 1
 
-        # Build directory from photo metadata directly
-        # Do not request the set page as set_id extraction is unreliable
-        # and single photos belong to user's general upload album
-        directory = {
-            "set_id": photo.get("set_id", ""),
-            "username": photo.get("username", ""),
-            "user_id": photo.get("user_id", ""),
-            "user_pfbid": photo.get("user_pfbid", ""),
-            "title": "",
-            "first_photo_id": photo_id,
-        }
+        set_id = photo.get("set_id", "")
+
+        # Only request set page for multi-image posts (pcb. prefix)
+        # Single-image posts belong to user's general upload album
+        if set_id.startswith("pcb."):
+            set_url = f"{self.root}/media/set/?set={set_id}"
+            set_page = self.request(set_url).text
+            directory = self.parse_set_page(set_page)
+        else:
+            directory = {
+                "set_id": set_id,
+                "username": photo.get("username", ""),
+                "user_id": photo.get("user_id", ""),
+                "user_pfbid": photo.get("user_pfbid", ""),
+                "title": "",
+                "first_photo_id": photo_id,
+            }
 
         yield Message.Directory, "", directory
         yield Message.Url, photo["url"], photo
