@@ -405,6 +405,10 @@ class FacebookPhotoExtractor(FacebookExtractor):
 
     def items(self):
         photo_id = self.groups[0]
+
+        # Check if original URL explicitly specifies a set
+        url_has_set = "&set=" in self.url or "?set=" in self.url
+
         photo_url = f"{self.root}/photo/?fbid={photo_id}&set="
         photo_page = self.photo_page_request_wrapper(photo_url).text
 
@@ -413,9 +417,9 @@ class FacebookPhotoExtractor(FacebookExtractor):
 
         set_id = photo.get("set_id", "")
 
-        # Only request set page for multi-image posts (pcb. prefix)
-        # Single-image posts belong to user's general upload album
-        if set_id.startswith("pcb."):
+        # Only request set page if URL explicitly specifies a set
+        # Single-image posts without set parameter use general upload album
+        if url_has_set and set_id:
             set_url = f"{self.root}/media/set/?set={set_id}"
             set_page = self.request(set_url).text
             directory = self.parse_set_page(set_page)
