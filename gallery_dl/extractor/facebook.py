@@ -579,31 +579,60 @@ class FacebookSetExtractor(FacebookExtractor):
         yield Message.Directory, "", directory
         yield Message.Url, photo["url"], photo
 
+    def _yield_multi_photo_post(self, post_page, owner_id, post_id, set_token):
+        """Walk a multi-photo post's own set with clean owner identity.
+
+        Like _yield_single_photo_post, the owner fields written into
+        set_data come from the post page's own creation_story rather
+        than from parse_set_page, so they cannot be poisoned by
+        sidebar / recommended embeds in the post page HTML.
+
+        set_token is the verified own 'pcb.<post_id>' from
+        _find_own_mediaset_token.
+        """
+        set_url = f"{self.root}/media/set/?set={set_token}"
+        set_page = self.request(set_url).text
+        set_data = self.parse_set_page(set_page)
+
+        username = self._extract_owner_username(post_page, owner_id) \
+            or set_data.get("username", "")
+        set_data["user_id"] = owner_id
+        set_data["user_pfbid"] = ""
+        set_data["username"] = username
+        set_data["post_id"] = post_id
+
+        return self.extract_set(set_data)
+
     def items(self):
         set_id, path, first_pid, set_id2, pcb1, pcb2, pcb3 = self.groups
         if not set_id:
             set_id = set_id2
 
-        if path:
-            post_url = f"{self.root}/{path}"
-            post_page = self.request(post_url).text
+        # Stage 1: post-page-based clean-id flow.
+        # All URL forms that map to a single FB post (vanity/posts/*,
+        # permalink.php?story_fbid=*, posts.php?*, events/*post_id=*)
+        # go through one unified path: fetch the anchor URL, decode
+        # creation_story, and decide single-vs-multi from server data
+        # rather than from the URL form.
+        if path or (not set_id and (pcb1 or pcb2 or pcb3)):
+            anchor_url = f"{self.root}/{path}" if path else self.url
+            post_page = self.request(anchor_url).text
 
-            # Try clean-id flow first: derive (owner, post_id) from
-            # the post page's own creation_story.
             owner_id, post_id = self._extract_post_identity(post_page)
             if post_id:
+                self._detect_jump = False
                 own_token = self._find_own_mediaset_token(post_page, post_id)
                 if own_token:
-                    # multi-photo: use the verified own set token
-                    set_id = own_token
-                    self._detect_jump = False
-                else:
-                    # single-photo: yield directly, do NOT delegate to
-                    # FacebookPhotoExtractor (would re-contaminate set)
-                    return self._yield_single_photo_post(
-                        post_page, owner_id, post_id)
-            else:
-                # legacy fallback when creation_story can't be parsed
+                    return self._yield_multi_photo_post(
+                        post_page, owner_id, post_id, own_token)
+                return self._yield_single_photo_post(
+                    post_page, owner_id, post_id)
+
+            # Legacy fallback when creation_story can't be decoded
+            # (HTML format change, unfamiliar post type). Reuses the
+            # already-fetched post_page so this branch is no slower
+            # than pre-clean-id behaviour.
+            if path:
                 post = self.parse_post_page(post_page)
                 set_id = post["set_id"]
                 if not set_id:
@@ -612,30 +641,30 @@ class FacebookSetExtractor(FacebookExtractor):
                     self.groups = (params["fbid"],)
                     return FacebookPhotoExtractor.items(self)
                 self._detect_jump = False
-        elif not set_id:
-            # permalink.php?story_fbid=... / posts.php?... / event post_id=...
-            # Try clean-id flow against the original URL first.
-            post_page = self.request(self.url).text
-            owner_id, post_id = self._extract_post_identity(post_page)
-            if post_id:
-                own_token = self._find_own_mediaset_token(post_page, post_id)
-                if own_token:
-                    set_id = own_token
-                    self._detect_jump = False
-                else:
-                    return self._yield_single_photo_post(
-                        post_page, owner_id, post_id)
             else:
                 set_id = "pcb." + (pcb1 or pcb2 or pcb3)
                 self._detect_jump = False
         elif set_id.startswith("pcb."):
             self._detect_jump = False
 
+        # Stage 2: legacy set flow.
+        # Used by:
+        #   * direct media/set/?set=pcb.<id>  (we trust the URL — there
+        #     is no sidebar contamination on a real set page)
+        #   * profile-bound sets (pb./a./t.) — these are user albums,
+        #     not posts; the post-centric flow does not apply
+        #   * the clean-id fallback path above
         set_url = f"{self.root}/media/set/?set={set_id}"
         set_page = self.request(set_url).text
         set_data = self.parse_set_page(set_page)
         if first_pid:
             set_data["first_photo_id"] = first_pid
+
+        # When the URL gives us a 'pcb.<digits>' set, the digits are
+        # the canonical numeric post_id; expose it for clean-id-based
+        # filename / archive templates.
+        if set_id.startswith("pcb.") and set_id[4:].isdigit():
+            set_data["post_id"] = set_id[4:]
 
         return self.extract_set(set_data)
 
