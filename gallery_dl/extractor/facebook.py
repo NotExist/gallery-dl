@@ -98,6 +98,23 @@ class FacebookExtractor(Extractor):
             return "pcb." + post_id
         return None
 
+    def _extract_owner_username(self, page, post_user_id):
+        """Find the display name of the post owner.
+
+        Looks for the first 'actors' entry whose 'id' matches the
+        post owner's numeric user_id, then returns its unescaped
+        'name' field. Returns '' if not found.
+        """
+        if not post_user_id:
+            return ""
+        needle = '"id":"' + post_user_id + '"'
+        for actor in text.extract_iter(page, '"actors":[{', '}'):
+            if needle in actor:
+                name = text.extr(actor, '"name":"', '"')
+                if name:
+                    return self.decode_all(name)
+        return ""
+
     def parse_set_page(self, set_page):
         directory = {
             "set_id": text.extr(
@@ -502,6 +519,66 @@ class FacebookSetExtractor(FacebookExtractor):
     )
     example = "https://www.facebook.com/media/set/?set=SET_ID"
 
+    def _yield_single_photo_post(self, post_page, owner_id, post_id):
+        """Yield Directory + Url for a single-photo post.
+
+        Bypasses the legacy fallback of delegating to
+        FacebookPhotoExtractor, which re-fetches the photo page and
+        derives a set_id from the photo HTML — for shared / cross-posted
+        photos that set is the *original* owner's set, so the legacy
+        flow's directory metadata then points at an unrelated user
+        (and the wrong photos get downloaded if extract_set runs).
+
+        owner_id and post_id come from the post page's first
+        'creation_story', which is the canonical identity of the
+        page's own post, regardless of any sidebar/recommended embeds.
+        """
+        # First Photo node sits inside the page's own post block (the
+        # creation_story for that block is what we just decoded).
+        media_block = text.extr(
+            post_page, '"__isMedia":"Photo"', '"target_group"')
+        first_photo_url = (
+            text.extr(media_block, '"url":"', ',') if media_block else "")
+        if not first_photo_url:
+            return
+        params = text.parse_query(first_photo_url.partition("?")[2])
+        photo_fbid = params.get("fbid")
+        if not photo_fbid:
+            return
+
+        # Fetch the photo page WITHOUT a set context — passing the
+        # contaminated set= would let FB redirect us into the wrong
+        # gallery again.
+        photo_url = f"{self.root}/photo/?fbid={photo_fbid}&set="
+        photo_page = self.photo_page_request_wrapper(photo_url).text
+        photo = self.parse_photo_page(photo_page)
+        photo["num"] = 1
+
+        # Override owner identity with values from the post page's
+        # own creation_story; the values parse_photo_page extracted
+        # from the photo HTML may belong to the original (cross-post)
+        # owner instead of the post owner.
+        username = self._extract_owner_username(post_page, owner_id) \
+            or photo.get("username", "")
+        photo["user_id"] = owner_id
+        photo["user_pfbid"] = ""
+        photo["username"] = username
+        photo["post_id"] = post_id
+        photo["set_id"] = ""
+
+        directory = {
+            "user_id"      : owner_id,
+            "user_pfbid"   : "",
+            "username"     : username,
+            "post_id"      : post_id,
+            "set_id"       : "",
+            "title"        : "",
+            "first_photo_id": photo_fbid,
+        }
+
+        yield Message.Directory, "", directory
+        yield Message.Url, photo["url"], photo
+
     def items(self):
         set_id, path, first_pid, set_id2, pcb1, pcb2, pcb3 = self.groups
         if not set_id:
@@ -510,17 +587,47 @@ class FacebookSetExtractor(FacebookExtractor):
         if path:
             post_url = f"{self.root}/{path}"
             post_page = self.request(post_url).text
-            post = self.parse_post_page(post_page)
 
-            set_id = post["set_id"]
-            if not set_id:
-                params = text.parse_query(post["post_photo"].partition("?")[2])
-                self.groups = (params["fbid"],)
-                return FacebookPhotoExtractor.items(self)
-            self._detect_jump = False
+            # Try clean-id flow first: derive (owner, post_id) from
+            # the post page's own creation_story.
+            owner_id, post_id = self._extract_post_identity(post_page)
+            if post_id:
+                own_token = self._find_own_mediaset_token(post_page, post_id)
+                if own_token:
+                    # multi-photo: use the verified own set token
+                    set_id = own_token
+                    self._detect_jump = False
+                else:
+                    # single-photo: yield directly, do NOT delegate to
+                    # FacebookPhotoExtractor (would re-contaminate set)
+                    return self._yield_single_photo_post(
+                        post_page, owner_id, post_id)
+            else:
+                # legacy fallback when creation_story can't be parsed
+                post = self.parse_post_page(post_page)
+                set_id = post["set_id"]
+                if not set_id:
+                    params = text.parse_query(
+                        post["post_photo"].partition("?")[2])
+                    self.groups = (params["fbid"],)
+                    return FacebookPhotoExtractor.items(self)
+                self._detect_jump = False
         elif not set_id:
-            set_id = "pcb." + (pcb1 or pcb2 or pcb3)
-            self._detect_jump = False
+            # permalink.php?story_fbid=... / posts.php?... / event post_id=...
+            # Try clean-id flow against the original URL first.
+            post_page = self.request(self.url).text
+            owner_id, post_id = self._extract_post_identity(post_page)
+            if post_id:
+                own_token = self._find_own_mediaset_token(post_page, post_id)
+                if own_token:
+                    set_id = own_token
+                    self._detect_jump = False
+                else:
+                    return self._yield_single_photo_post(
+                        post_page, owner_id, post_id)
+            else:
+                set_id = "pcb." + (pcb1 or pcb2 or pcb3)
+                self._detect_jump = False
         elif set_id.startswith("pcb."):
             self._detect_jump = False
 
