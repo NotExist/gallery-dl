@@ -304,7 +304,7 @@ class FacebookExtractor(Extractor):
                         "Detected a loop in the set, it's likely finished. "
                         "Extraction is over."
                     )
-            elif self._detect_jump and not set_id.startswith('pcb.') and \
+            elif self._detect_jump and \
                     int(photo["next_photo_id"]) > int(photo["id"]) + i*120:
                 self.log.info(
                     "Detected jump to the beginning of the set. (%s -> %s)",
@@ -466,6 +466,9 @@ class FacebookSetExtractor(FacebookExtractor):
             self._detect_jump = False
         elif not set_id:
             set_id = "pcb." + (pcb1 or pcb2 or pcb3)
+            self._detect_jump = False
+        elif set_id.startswith("pcb."):
+            self._detect_jump = False
 
         set_url = f"{self.root}/media/set/?set={set_id}"
         set_page = self.request(set_url).text
