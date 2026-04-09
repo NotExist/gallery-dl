@@ -8,6 +8,7 @@
 
 from .common import Extractor, Message, Dispatch
 from .. import text, util
+import binascii
 
 BASE_PATTERN = r"(?:https?://)?(?:[\w-]+\.)?facebook\.com"
 USER_PATTERN = (BASE_PATTERN +
@@ -43,6 +44,59 @@ class FacebookExtractor(Extractor):
             txt.encode().decode("unicode_escape")
             .encode("utf_16", "surrogatepass").decode("utf_16")
         ).replace("\\/", "/")
+
+    def _decode_creation_story_id(self, encoded):
+        """Decode the base64 'creation_story.id' value.
+
+        The encoded string decodes to 'S:_I<post_user_id>:<post_id>:<post_id>'
+        where both ids are stable numeric identifiers (independent of any
+        per-session 'pfbid' token). Returns (post_user_id, post_id) as
+        strings, or (None, None) on any failure.
+        """
+        try:
+            decoded = binascii.a2b_base64(encoded + "==").decode()
+        except Exception:
+            return None, None
+        parts = decoded.split(":")
+        if len(parts) >= 3 and parts[1].startswith("_I"):
+            return parts[1][2:], parts[2]
+        return None, None
+
+    def _extract_post_identity(self, page):
+        """Extract the canonical (post_user_id, post_id) of a post page.
+
+        A Facebook post page may embed multiple posts (sidebar, recommended,
+        cross-post sources). The first 'creation_story' block in the HTML
+        belongs to the page's own post. Decoding its 'id' field yields
+        clean numeric identifiers regardless of the URL form (vanity vs
+        numeric, pfbid vs numeric).
+
+        Returns (post_user_id, post_id) on success or (None, None) if no
+        creation_story block can be parsed.
+        """
+        block = text.extr(page, '"creation_story":{', '}')
+        if not block:
+            return None, None
+        token = text.extr(block, '"id":"', '"')
+        if not token:
+            return None, None
+        return self._decode_creation_story_id(token)
+
+    def _find_own_mediaset_token(self, page, post_id):
+        """Return 'pcb.<post_id>' if the page contains a mediaset_token
+        whose numeric part matches 'post_id', otherwise None.
+
+        For multi-photo posts, FB embeds the post's own set as
+        '"mediaset_token":"pcb.<numeric_post_id>"'. Other embedded posts
+        in the same HTML use their own (different) numeric ids, so an
+        exact match against 'post_id' unambiguously identifies the
+        post's own set without any byte-distance heuristic.
+        """
+        if not post_id:
+            return None
+        if page.find('"mediaset_token":"pcb.' + post_id + '"') >= 0:
+            return "pcb." + post_id
+        return None
 
     def parse_set_page(self, set_page):
         directory = {
