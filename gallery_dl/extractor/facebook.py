@@ -20,9 +20,9 @@ class FacebookExtractor(Extractor):
     """Base class for Facebook extractors"""
     category = "facebook"
     root = "https://www.facebook.com"
-    directory_fmt = ("{category}", "{username}", "{title}{set_id:? (/)/}")
+    directory_fmt = ("{category}", "{username}", "{post_id|set_id}")
     filename_fmt = "{id}.{extension}"
-    archive_fmt = "{id}.{extension}"
+    archive_fmt = "{post_id:?/_/}{id}.{extension}"
 
     def _init(self):
         headers = self.session.headers

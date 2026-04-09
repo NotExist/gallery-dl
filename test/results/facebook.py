@@ -199,11 +199,47 @@ __tests__ = (
     "first_photo_id": "122225439782273753",
     "followups_ids" : [],
     "id"            : r"re:12\d+",
-    "set_id"        : "pcb.pfbid02P6zhg3UN71iAM1kiprstNfZuArXc83n5n1X842kPbsyQU6BdAUacgNsHw3LkmKasl",
+    "post_id"       : r"re:\d+",
+    "set_id"        : "",
     "title"         : "Photos from 金城漫與畫's post",
     "user_id"       : "61558212601742",
     "user_pfbid"    : "",
     "username"      : "金城漫與畫",
+},
+
+{
+    "#url"     : "https://www.facebook.com/PixyNSFW/posts/pfbid02qiQ6TYUGVr8N5DNBmgZTC6iCfD8NCDkT49k269s3qsyrK7eaz3VdK2M59SRsHcTUl",
+    "#comment" : "single-photo '/<vanity>/posts/<pfbid>' post; HTML "
+                 "embeds an unrelated 'pcb.*' set in the sidebar that "
+                 "the legacy flow followed into a third party's gallery",
+    "#class"   : facebook.FacebookSetExtractor,
+    "#auth"    : True,
+    "#count"   : 1,
+
+    "first_photo_id": "1520962096168345",
+    "id"            : "1520962096168345",
+    "post_id"       : "1520962169501671",
+    "set_id"        : "",
+    "user_id"       : "100047637073622",
+    "user_pfbid"    : "",
+    "username"      : "Pixy",
+},
+
+{
+    "#url"     : "https://www.facebook.com/permalink.php?story_fbid=pfbid02cyK3VknfeCjtHP8BKDZkXxJzXMYpAMzpvGvHa3H8ePKirvt5ubyfzFDCzichmv92l&id=61560335556218",
+    "#comment" : "single-photo permalink.php post; legacy flow leaked "
+                 "the per-session pfbid token into 'set_id'",
+    "#class"   : facebook.FacebookSetExtractor,
+    "#auth"    : True,
+    "#count"   : 1,
+
+    "first_photo_id": "122203495466344518",
+    "id"            : "122203495466344518",
+    "post_id"       : "122203495490344518",
+    "set_id"        : "",
+    "user_id"       : "61560335556218",
+    "user_pfbid"    : "",
+    "username"      : "ㄖ卩卩卂丨「胸」 1.1",
 },
 
 {
