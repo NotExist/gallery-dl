@@ -686,6 +686,17 @@ class FacebookPostExtractor(FacebookExtractor):
             "post_pfbid" : post_pfbid,
         }
 
+        # For single-photo posts, pre-fetch the photo and its parent
+        # album so that set_id / title are available in directory
+        # metadata BEFORE the first yield (keeps JSON + photo in
+        # the same directory when users customise directory_fmt).
+        photo_data = None
+        if not own_token:
+            photo_data = self._resolve_single_photo(post_page)
+            if photo_data:
+                directory["set_id"] = photo_data.get("set_id", "")
+                directory["title"] = photo_data.get("title", "")
+
         yield Message.Directory, "", directory
 
         # Dump post content as JSON file
@@ -708,9 +719,9 @@ class FacebookPostExtractor(FacebookExtractor):
         if own_token:
             yield from self._post_photos_multi(
                 post_page, directory, own_token)
-        else:
-            yield from self._post_photos_single(
-                post_page, directory)
+        elif photo_data:
+            photo_data.update(directory)
+            yield Message.Url, photo_data["url"], photo_data
 
     def _post_photos_multi(self, post_page, directory, set_token):
         """Walk a multi-photo post's set with clean post metadata."""
@@ -728,29 +739,44 @@ class FacebookPostExtractor(FacebookExtractor):
         self._detect_jump = False
         yield from self.extract_set(set_data)
 
-    def _post_photos_single(self, post_page, directory):
-        """Fetch and yield a single photo from the post."""
+    def _resolve_single_photo(self, post_page):
+        """Fetch the single photo and its parent album metadata.
+
+        Returns a photo dict with set_id, title, url, id, etc.
+        populated, or None if extraction fails.  Does NOT yield —
+        the caller handles Directory/Url emission so that JSON
+        content and the photo share the same directory context.
+        """
         media_block = text.extr(
             post_page, '"__isMedia":"Photo"', '"target_group"')
         first_photo_url = (
             text.extr(media_block, '"url":"', ',')
             if media_block else "")
         if not first_photo_url:
-            return
+            return None
 
         params = text.parse_query(first_photo_url.partition("?")[2])
         photo_fbid = params.get("fbid")
         if not photo_fbid:
-            return
+            return None
 
         photo_url = f"{self.root}/photo/?fbid={photo_fbid}&set="
         photo_page = self.photo_page_request_wrapper(photo_url).text
         photo = self.parse_photo_page(photo_page)
         photo["num"] = 1
-        photo.update(directory)
         photo["id"] = photo.get("id") or photo_fbid
 
-        yield Message.Url, photo["url"], photo
+        # Populate album metadata (set_id + title) from the photo's
+        # parent set — same as PhotoExtractor does.  This makes
+        # {title} and {set_id} available for users who customise
+        # directory_fmt to use SetExtractor-style paths.
+        if photo.get("set_id"):
+            set_url = f"{self.root}/media/set/?set={photo['set_id']}"
+            set_page = self.request(set_url).text
+            album = self.parse_set_page(set_page)
+            photo["title"] = album.get("title", "")
+
+        return photo
 
 
 class FacebookPermalinkExtractor(FacebookExtractor):
