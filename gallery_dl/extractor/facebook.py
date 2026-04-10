@@ -257,7 +257,10 @@ class FacebookExtractor(Extractor):
             te = section.find('"', ts)
             if te <= ts:
                 continue
-            body_text = self.decode_all(section[ts:te])
+            try:
+                body_text = self.decode_all(section[ts:te])
+            except Exception:
+                body_text = section[ts:te]
 
             # author name — search backward up to 2 KB
             ctx = section[max(0, pos - 2048):pos]
@@ -267,7 +270,10 @@ class FacebookExtractor(Extractor):
                 ns = ni + 8
                 ne = ctx.find('"', ns)
                 if ne > ns:
-                    author = self.decode_all(ctx[ns:ne])
+                    try:
+                        author = self.decode_all(ctx[ns:ne])
+                    except Exception:
+                        author = ctx[ns:ne]
 
             replies.append({"author": author, "text": body_text})
 
