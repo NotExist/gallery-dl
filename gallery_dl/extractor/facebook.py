@@ -753,6 +753,55 @@ class FacebookPostExtractor(FacebookExtractor):
         yield Message.Url, photo["url"], photo
 
 
+class FacebookPermalinkExtractor(FacebookExtractor):
+    """Resolver for Facebook permalink and event post URLs.
+
+    Fetches the URL, identifies the content type from the server
+    response, and dispatches to the appropriate extractor
+    (PostExtractor for posts, SetExtractor as fallback).
+    """
+    subcategory = "permalink"
+    pattern = (
+        BASE_PATTERN +
+        r"/(?:(?:groups/)?(?:[^/?#]+/)?permalink(?:\.php)?"
+        r"(?:/(\d+)|\?\w+=([^/?#]+))"
+        r"|events/[^/?#]+/\??post_id=(\d+))"
+    )
+    example = ("https://www.facebook.com/"
+               "permalink.php?story_fbid=STORY_ID&id=USER_ID")
+
+    def items(self):
+        page = self.request(self.url).text
+
+        # Try to resolve to a post via owner-anchored extraction
+        owner_hint = self._extract_owner_hint(self.url)
+        ctx = self._find_owner_context(page, owner_hint) \
+            if owner_hint else {}
+        cs_uid, cs_pid = self._extract_post_identity(page)
+
+        owner_id = ctx.get("owner_uid") or cs_uid or \
+            (owner_hint if owner_hint.isdigit() else "")
+        post_id = ctx.get("post_id") or cs_pid
+
+        if post_id and post_id.isdigit() and owner_id and owner_id.isdigit():
+            # Resolved as a post → dispatch to PostExtractor
+            canonical = f"{self.root}/{owner_id}/posts/{post_id}"
+            yield Message.Queue, canonical, {
+                "_extractor": FacebookPostExtractor,
+            }
+            return
+
+        # Fallback: construct a set URL from the captured token
+        pcb1, pcb2, pcb3 = self.groups
+        raw = pcb1 or pcb2 or pcb3
+        if raw:
+            token = raw.partition("&")[0]  # strip &id=... suffix
+            set_url = f"{self.root}/media/set/?set=pcb.{token}"
+            yield Message.Queue, set_url, {
+                "_extractor": FacebookSetExtractor,
+            }
+
+
 class FacebookPhotoExtractor(FacebookExtractor):
     """Base class for Facebook Photo extractors"""
     subcategory = "photo"

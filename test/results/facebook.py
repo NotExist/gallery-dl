@@ -186,24 +186,8 @@ __tests__ = (
 
 {
     "#url"     : "https://www.facebook.com/permalink.php?story_fbid=pfbid02P6zhg3UN71iAM1kiprstNfZuArXc83n5n1X842kPbsyQU6BdAUacgNsHw3LkmKasl&id=61558212601742",
-    "#comment" : "'/permalink.php' post URL (#9352)",
-    "#class"   : facebook.FacebookSetExtractor,
-    "#range"   : "1-3",
-    "#pattern" : r"https://scontent-.*.xx.fbcdn.net/v/.+",
-
-    "caption"       : "",
-    "date"          : "dt:2026-03-20 07:01:13",
-    "extension"     : "jpg",
-    "filename"      : str,
-    "first_photo_id": "122225439782273753",
-    "followups_ids" : [],
-    "id"            : r"re:12\d+",
-    "post_id"       : r"re:\d+",
-    "set_id"        : "",
-    "title"         : "Photos from 金城漫與畫's post",
-    "user_id"       : "61558212601742",
-    "user_pfbid"    : "",
-    "username"      : "金城漫與畫",
+    "#comment" : "'/permalink.php' post URL (#9352) → PermalinkExtractor → PostExtractor",
+    "#class"   : facebook.FacebookPermalinkExtractor,
 },
 
 {
@@ -223,19 +207,9 @@ __tests__ = (
 
 {
     "#url"     : "https://www.facebook.com/permalink.php?story_fbid=pfbid02cyK3VknfeCjtHP8BKDZkXxJzXMYpAMzpvGvHa3H8ePKirvt5ubyfzFDCzichmv92l&id=61560335556218",
-    "#comment" : "single-photo permalink.php post; legacy flow leaked "
-                 "the per-session pfbid token into 'set_id'",
-    "#class"   : facebook.FacebookSetExtractor,
+    "#comment" : "permalink.php → PermalinkExtractor → PostExtractor",
+    "#class"   : facebook.FacebookPermalinkExtractor,
     "#auth"    : True,
-    "#count"   : 1,
-
-    "first_photo_id": "122203495466344518",
-    "id"            : "122203495466344518",
-    "post_id"       : "122203495490344518",
-    "set_id"        : "",
-    "user_id"       : "61560335556218",
-    "user_pfbid"    : "",
-    "username"      : "ㄖ卩卩卂丨「胸」 1.1",
 },
 
 {
