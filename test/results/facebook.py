@@ -154,11 +154,10 @@ __tests__ = (
 
 {
     "#url"     : "https://www.facebook.com/joho.press.jp/posts/pfbid02mfFRpVkErLQxQ8cpD2f1hwXEVsFzK8kfNBKdK2Jndnx6AkmMQZuXhovwDgwvoDNil",
-    "#class"   : facebook.FacebookSetExtractor,
+    "#class"   : facebook.FacebookPostExtractor,
     "#range"   : "1-3",
     "#count"   : 3,
 
-    "set_id"   : "pcb.1160563418981189",
     "user_id"  : "100050826247807",
     "username" : "情報プレスα",
 },
@@ -209,20 +208,17 @@ __tests__ = (
 
 {
     "#url"     : "https://www.facebook.com/PixyNSFW/posts/pfbid02qiQ6TYUGVr8N5DNBmgZTC6iCfD8NCDkT49k269s3qsyrK7eaz3VdK2M59SRsHcTUl",
-    "#comment" : "single-photo '/<vanity>/posts/<pfbid>' post; HTML "
-                 "embeds an unrelated 'pcb.*' set in the sidebar that "
-                 "the legacy flow followed into a third party's gallery",
-    "#class"   : facebook.FacebookSetExtractor,
+    "#comment" : "single-photo post via PostExtractor; HTML embeds "
+                 "unrelated 'pcb.*' sets in the sidebar",
+    "#class"   : facebook.FacebookPostExtractor,
     "#auth"    : True,
-    "#count"   : 1,
+    "#count"   : 2,
 
-    "first_photo_id": "1520962096168345",
-    "id"            : "1520962096168345",
     "post_id"       : "1520962169501671",
-    "set_id"        : "",
     "user_id"       : "100047637073622",
-    "user_pfbid"    : "",
     "username"      : "Pixy",
+    "body"          : "@chihel2731",
+    "post_pfbid"    : "pfbid02qiQ6TYUGVr8N5DNBmgZTC6iCfD8NCDkT49k269s3qsyrK7eaz3VdK2M59SRsHcTUl",
 },
 
 {

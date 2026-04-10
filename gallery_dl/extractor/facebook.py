@@ -9,6 +9,7 @@
 from .common import Extractor, Message, Dispatch
 from .. import text, util
 import binascii
+import json
 
 BASE_PATTERN = r"(?:https?://)?(?:[\w-]+\.)?facebook\.com"
 USER_PATTERN = (BASE_PATTERN +
@@ -114,6 +115,174 @@ class FacebookExtractor(Extractor):
                 if name:
                     return self.decode_all(name)
         return ""
+
+    def _extract_owner_hint(self, url):
+        """Extract an owner identifier from a URL.
+
+        Returns a string (numeric user_id or vanity) that can be
+        searched for in the page HTML to locate the owner's post
+        block. Returns '' if no hint can be derived.
+        """
+        # /<vanity_or_numeric>/posts/<token>
+        if "/posts/" in url:
+            return url.split("/posts/")[0].rsplit("/", 1)[-1]
+        # permalink.php?...&id=<numeric> or ?id=<numeric>
+        for sep in ("&id=", "?id="):
+            val = text.extr(url, sep, "&") or text.extr(url, sep, "")
+            if val and val.isdigit():
+                return val
+        return ""
+
+    def _find_owner_context(self, page, owner_hint):
+        """Search the page HTML near owner_hint occurrences for post data.
+
+        Scans all positions where owner_hint appears and checks a
+        ±4 KB window around each for:
+          mediaset_token, post_id, body (message text),
+          owner_uid (numeric), owner_name (display name).
+
+        Returns a dict of found fields (first find wins per field)
+        plus '_owner_pos' — the byte offset where post_id was found,
+        used to scope reply extraction.
+        """
+        if not owner_hint:
+            return {}
+
+        RADIUS = 4096
+        result = {}
+        pos = -1
+
+        while True:
+            pos = page.find(owner_hint, pos + 1)
+            if pos < 0:
+                break
+
+            start = max(0, pos - RADIUS)
+            chunk = page[start:min(len(page), pos + RADIUS)]
+
+            # mediaset_token
+            if "mediaset_token" not in result:
+                needle = '"mediaset_token":"'
+                idx = chunk.find(needle)
+                if idx >= 0:
+                    vs = idx + len(needle)
+                    ve = chunk.find('"', vs)
+                    if ve > vs:
+                        result["mediaset_token"] = chunk[vs:ve]
+
+            # post_id
+            if "post_id" not in result:
+                needle = '"post_id":"'
+                idx = chunk.find(needle)
+                if idx >= 0:
+                    vs = idx + len(needle)
+                    ve = chunk.find('"', vs)
+                    if ve > vs and chunk[vs:ve].isdigit():
+                        result["post_id"] = chunk[vs:ve]
+                        result["_owner_pos"] = pos
+
+            # body (message text — NOT "body":{"text"} which is comments)
+            if "body" not in result:
+                mi = chunk.find('"message":{')
+                if mi >= 0:
+                    ti = chunk.find('"text":"', mi)
+                    if 0 <= ti - mi < 2000:
+                        te = chunk.find('"', ti + 8)
+                        if te > ti + 8:
+                            result["body"] = self.decode_all(
+                                chunk[ti + 8:te])
+
+            # owner_uid: resolve vanity → numeric user_id
+            if "owner_uid" not in result:
+                if owner_hint.isdigit():
+                    # Numeric hint IS the user_id
+                    result["owner_uid"] = owner_hint
+                else:
+                    # Vanity resolution via '/<vanity>","id":"<uid>"'
+                    vn = 'facebook.com\\/' + owner_hint + '","id":"'
+                    vi = chunk.find(vn)
+                    if vi >= 0:
+                        vs = vi + len(vn)
+                        ve = chunk.find('"', vs)
+                        if ve > vs and chunk[vs:ve].isdigit():
+                            result["owner_uid"] = chunk[vs:ve]
+
+            # owner_name: find "name":"<val>" near resolved uid
+            if "owner_uid" in result and "owner_name" not in result:
+                uid_needle = '"id":"' + result["owner_uid"] + '"'
+                ui = chunk.find(uid_needle)
+                if ui >= 0:
+                    nearby = chunk[max(0, ui - 200):ui + 200]
+                    ni = nearby.find('"name":"')
+                    if ni >= 0:
+                        ns = ni + 8
+                        ne = nearby.find('"', ns)
+                        if ne > ns:
+                            result["owner_name"] = self.decode_all(
+                                nearby[ns:ne])
+
+            if all(k in result for k in (
+                "mediaset_token", "post_id", "body",
+                "owner_uid", "owner_name",
+            )):
+                break
+
+        return result
+
+    def _extract_replies(self, page, owner_pos):
+        """Extract pre-loaded replies from already-fetched HTML.
+
+        Searches for comment body nodes ('"body":{"text":"..."}')
+        within ~500 KB after the owner's post block position.
+        This range covers the own post's pre-rendered comments
+        but excludes sidebar / recommended content that appears
+        much later in the HTML.
+
+        Does NOT make additional HTTP requests.
+        """
+        if owner_pos < 0:
+            return []
+
+        section = page[owner_pos:owner_pos + 524288]
+        replies = []
+        needle = '"body":{"text":"'
+        pos = -1
+
+        while True:
+            pos = section.find(needle, pos + 1)
+            if pos < 0:
+                break
+
+            ts = pos + len(needle)
+            te = section.find('"', ts)
+            if te <= ts:
+                continue
+            body_text = self.decode_all(section[ts:te])
+
+            # author name — search backward up to 2 KB
+            ctx = section[max(0, pos - 2048):pos]
+            ni = ctx.rfind('"name":"')
+            author = ""
+            if ni >= 0:
+                ns = ni + 8
+                ne = ctx.find('"', ns)
+                if ne > ns:
+                    author = self.decode_all(ctx[ns:ne])
+
+            replies.append({"author": author, "text": body_text})
+
+        return replies
+
+    def _extract_url_pfbid(self):
+        """Extract a pfbid token from the request URL, if present."""
+        pos = self.url.find("pfbid")
+        if pos < 0:
+            return ""
+        end = pos + 5
+        url = self.url
+        while end < len(url) and url[end].isalnum():
+            end += 1
+        return url[pos:end]
 
     def parse_set_page(self, set_page):
         directory = {
@@ -459,6 +628,129 @@ class FacebookExtractor(Extractor):
                 self.log.debug("Failed to extract user data: %s", data)
                 user = {}
         return user
+
+
+class FacebookPostExtractor(FacebookExtractor):
+    """Extractor for Facebook Post pages"""
+    subcategory = "post"
+    directory_fmt = ("{category}", "{username}", "{post_id}")
+    filename_fmt = "{id}.{extension}"
+    archive_fmt = "{post_id}_{id}.{extension}"
+    pattern = BASE_PATTERN + r"/[^/?#]+/posts/([^/?#]+)"
+    example = "https://www.facebook.com/USERNAME/posts/POST_ID"
+
+    def items(self):
+        token = self.groups[0]
+        post_page = self.request(self.url).text
+
+        # Owner-anchored extraction (primary)
+        owner_hint = self._extract_owner_hint(self.url)
+        ctx = self._find_owner_context(post_page, owner_hint) \
+            if owner_hint else {}
+
+        # Creation story decode (supplementary / fallback)
+        cs_uid, cs_pid = self._extract_post_identity(post_page)
+
+        # Merge: owner context preferred, creation_story as fallback
+        owner_id = ctx.get("owner_uid") or cs_uid or \
+            (owner_hint if owner_hint.isdigit() else "")
+        post_id = ctx.get("post_id") or cs_pid
+        username = ctx.get("owner_name") or \
+            self._extract_owner_username(post_page, owner_id)
+        body = ctx.get("body", "")
+        own_token = ctx.get("mediaset_token")
+        post_pfbid = self._extract_url_pfbid()
+
+        # Fallback: if URL token is a pure numeric post_id
+        if not post_id and token.isdigit():
+            post_id = token
+        # Derive post_id from mediaset_token (pcb.<post_id>)
+        if not post_id and own_token and own_token.startswith("pcb."):
+            post_id = own_token[4:]
+
+        if not post_id:
+            self.log.warning(
+                "Could not extract post identity from '%s'", self.url)
+            return
+
+        # Extract replies from already-fetched HTML
+        replies = self._extract_replies(
+            post_page, ctx.get("_owner_pos", -1))
+
+        # Directory metadata
+        directory = {
+            "post_id"    : post_id,
+            "user_id"    : owner_id,
+            "username"   : username,
+            "body"       : body,
+            "post_pfbid" : post_pfbid,
+        }
+
+        yield Message.Directory, "", directory
+
+        # Dump post content as JSON file
+        content = json.dumps({
+            "post_id"    : post_id,
+            "user_id"    : owner_id,
+            "username"   : username,
+            "post_pfbid" : post_pfbid,
+            "body"       : body,
+            "replies"    : replies,
+        }, ensure_ascii=False, indent=2)
+        yield Message.Url, "text:" + content, {
+            **directory,
+            "filename" : post_id,
+            "extension": "json",
+            "id"       : post_id,
+        }
+
+        # Yield photo(s)
+        if own_token:
+            yield from self._post_photos_multi(
+                post_page, directory, own_token)
+        else:
+            yield from self._post_photos_single(
+                post_page, directory)
+
+    def _post_photos_multi(self, post_page, directory, set_token):
+        """Walk a multi-photo post's set with clean post metadata."""
+        set_url = f"{self.root}/media/set/?set={set_token}"
+        set_page = self.request(set_url).text
+        set_data = self.parse_set_page(set_page)
+
+        # Override owner identity with clean values from post page
+        set_data["user_id"] = directory["user_id"]
+        set_data["username"] = directory["username"]
+        set_data["post_id"] = directory["post_id"]
+        set_data["post_pfbid"] = directory.get("post_pfbid", "")
+        set_data["body"] = directory.get("body", "")
+
+        self._detect_jump = False
+        yield from self.extract_set(set_data)
+
+    def _post_photos_single(self, post_page, directory):
+        """Fetch and yield a single photo from the post."""
+        media_block = text.extr(
+            post_page, '"__isMedia":"Photo"', '"target_group"')
+        first_photo_url = (
+            text.extr(media_block, '"url":"', ',')
+            if media_block else "")
+        if not first_photo_url:
+            return
+
+        params = text.parse_query(first_photo_url.partition("?")[2])
+        photo_fbid = params.get("fbid")
+        if not photo_fbid:
+            return
+
+        photo_url = f"{self.root}/photo/?fbid={photo_fbid}&set="
+        photo_page = self.photo_page_request_wrapper(photo_url).text
+        photo = self.parse_photo_page(photo_page)
+        photo["num"] = 1
+        photo.update(directory)
+        photo["id"] = photo.get("id") or photo_fbid
+
+        yield Message.Url, photo["url"], photo
 
 
 class FacebookPhotoExtractor(FacebookExtractor):
