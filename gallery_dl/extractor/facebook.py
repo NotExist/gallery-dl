@@ -735,6 +735,13 @@ class FacebookPostExtractor(FacebookExtractor):
                 directory["set_id"] = photo_data.get("set_id", "")
                 directory["title"] = photo_data.get("title", "")
 
+        # Keep raw (undecoded) copy for _post_photos_multi —
+        # extract_set will decode once via _decode_metadata.
+        # Decoding directory here is for the Directory yield +
+        # JSON content; passing the decoded values into
+        # extract_set would cause a double-decode (mojibake).
+        raw_directory = dict(directory)
+
         self._decode_metadata(directory)
 
         # Decode replies for JSON output
@@ -762,13 +769,13 @@ class FacebookPostExtractor(FacebookExtractor):
             "id"       : post_id,
         }
 
-        # Yield photo(s)
+        # Yield photo(s) — pass raw_directory so extract_set
+        # decodes only once (not the already-decoded directory)
         if own_token:
             yield from self._post_photos_multi(
-                post_page, directory, own_token)
+                post_page, raw_directory, own_token)
         elif photo_data:
             photo_data.update(directory)
-            self._decode_metadata(photo_data)
             yield Message.Url, photo_data["url"], photo_data
 
     def _post_photos_multi(self, post_page, directory, set_token):
