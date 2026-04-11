@@ -126,10 +126,12 @@ class FacebookExtractor(Extractor):
         # /<vanity_or_numeric>/posts/<token>
         if "/posts/" in url:
             return url.split("/posts/")[0].rsplit("/", 1)[-1]
-        # permalink.php?...&id=<numeric> or ?id=<numeric>
-        for sep in ("&id=", "?id="):
-            val = text.extr(url, sep, "&") or text.extr(url, sep, "")
-            if val and val.isdigit():
+        # ?id=<numeric> or &id=<numeric> (may be last query param)
+        query = url.partition("?")[2]
+        if query:
+            params = text.parse_query(query)
+            val = params.get("id", "")
+            if val.isdigit():
                 return val
         return ""
 
