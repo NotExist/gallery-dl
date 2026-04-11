@@ -956,7 +956,7 @@ class FacebookVideoExtractor(FacebookExtractor):
     """Base class for Facebook Video extractors"""
     subcategory = "video"
     directory_fmt = ("{category}", "{username}", "{subcategory}")
-    pattern = BASE_PATTERN + r"/(?:[^/?#]+/videos/|watch/?\?v=)([^/?&#]+)"
+    pattern = BASE_PATTERN + r"/(?:[^/?#]+/videos/|watch/?\?v=|reel/)([^/?&#]+)"
     example = "https://www.facebook.com/watch/?v=VIDEO_ID"
 
     def items(self):
