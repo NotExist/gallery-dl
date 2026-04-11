@@ -40,11 +40,42 @@ class FacebookExtractor(Extractor):
         self.author_followups = self.config("author-followups", False)
         self._detect_jump = True
 
-    def decode_all(self, txt):
-        return text.unescape(
-            txt.encode().decode("unicode_escape")
-            .encode("utf_16", "surrogatepass").decode("utf_16")
-        ).replace("\\/", "/")
+    def _safe_decode(self, txt):
+        """Decode FB's unicode-escaped text with error tolerance."""
+        try:
+            decoded = txt.encode().decode("unicode_escape") \
+                .encode("utf_16", "surrogatepass").decode("utf_16")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            decoded = txt
+        return text.unescape(decoded).replace("\\/", "/")
+
+    # backward-compat alias
+    decode_all = _safe_decode
+
+    def _decode_metadata(self, data):
+        """Decode unicode-escaped strings in a metadata dict.
+
+        Called once before yielding so only values that actually
+        reach output get decoded, avoiding redundant work during
+        the parse / search phase.
+        """
+        for key in ("username", "title", "caption", "body",
+                     "user_pfbid", "biography"):
+            val = data.get(key)
+            if isinstance(val, str) and val:
+                data[key] = self._safe_decode(val)
+
+        for reply in data.get("replies", ()):
+            for rkey in ("text", "author"):
+                val = reply.get(rkey)
+                if isinstance(val, str) and val:
+                    reply[rkey] = self._safe_decode(val)
+
+        return data
+
+    def _decode_url(self, url_text):
+        """Minimal decode for URL fields — only unescape slashes."""
+        return url_text.replace("\\/", "/")
 
     def _decode_creation_story_id(self, encoded):
         """Decode the base64 'creation_story.id' value.
@@ -100,20 +131,13 @@ class FacebookExtractor(Extractor):
         return None
 
     def _extract_owner_username(self, page, post_user_id):
-        """Find the display name of the post owner.
-
-        Looks for the first 'actors' entry whose 'id' matches the
-        post owner's numeric user_id, then returns its unescaped
-        'name' field. Returns '' if not found.
-        """
+        """Find the display name of the post owner (raw, not decoded)."""
         if not post_user_id:
             return ""
         needle = '"id":"' + post_user_id + '"'
         for actor in text.extract_iter(page, '"actors":[{', '}'):
             if needle in actor:
-                name = text.extr(actor, '"name":"', '"')
-                if name:
-                    return self.decode_all(name)
+                return text.extr(actor, '"name":"', '"') or ""
         return ""
 
     def _extract_owner_hint(self, url):
@@ -191,8 +215,7 @@ class FacebookExtractor(Extractor):
                     if 0 <= ti - mi < 2000:
                         te = chunk.find('"', ti + 8)
                         if te > ti + 8:
-                            result["body"] = self.decode_all(
-                                chunk[ti + 8:te])
+                            result["body"] = chunk[ti + 8:te]
 
             # owner_uid: resolve vanity → numeric user_id
             if "owner_uid" not in result:
@@ -220,8 +243,7 @@ class FacebookExtractor(Extractor):
                         ns = ni + 8
                         ne = nearby.find('"', ns)
                         if ne > ns:
-                            result["owner_name"] = self.decode_all(
-                                nearby[ns:ne])
+                            result["owner_name"] = nearby[ns:ne]
 
             if all(k in result for k in (
                 "mediaset_token", "post_id", "body",
@@ -259,10 +281,7 @@ class FacebookExtractor(Extractor):
             te = section.find('"', ts)
             if te <= ts:
                 continue
-            try:
-                body_text = self.decode_all(section[ts:te])
-            except Exception:
-                body_text = section[ts:te]
+            body_text = section[ts:te]
 
             # author name — search backward up to 2 KB
             ctx = section[max(0, pos - 2048):pos]
@@ -272,10 +291,7 @@ class FacebookExtractor(Extractor):
                 ns = ni + 8
                 ne = ctx.find('"', ns)
                 if ne > ns:
-                    try:
-                        author = self.decode_all(ctx[ns:ne])
-                    except Exception:
-                        author = ctx[ns:ne]
+                    author = ctx[ns:ne]
 
             replies.append({"author": author, "text": body_text})
 
@@ -299,20 +315,20 @@ class FacebookExtractor(Extractor):
             ) or text.extr(
                 set_page, '"mediasetToken":"', '"'
             ),
-            "username": self.decode_all(
+            "username": (
                 text.extr(
                     set_page, '"user":{"__isProfile":"User","name":"', '","'
                 ) or text.extr(
                     set_page, '"actors":[{"__typename":"User","name":"', '","'
-                )
+                ) or ""
             ),
             "user_id": text.extr(
                 set_page, '"owner":{"__typename":"User","id":"', '"'
             ),
             "user_pfbid": "",
-            "title": self.decode_all(text.extr(
+            "title": text.extr(
                 set_page, '"title":{"text":"', '"'
-            )),
+            ) or "",
             "first_photo_id": text.extr(
                 set_page,
                 '{"__typename":"Photo","__isMedia":"Photo","',
@@ -344,23 +360,23 @@ class FacebookExtractor(Extractor):
                 '"url":"https:\\/\\/www.facebook.com\\/photo\\/?fbid=',
                 '"'
             ).rsplit("&set=", 1)[-1],
-            "username": self.decode_all(text.extr(
+            "username": text.extr(
                 photo_page, '"owner":{"__typename":"User","name":"', '"'
-            )),
+            ) or "",
             "user_id": text.extr(
                 photo_page, '"owner":{"__typename":"User","id":"', '"'
             ),
             "user_pfbid": "",
-            "caption": self.decode_all(text.extr(
+            "caption": text.extr(
                 photo_page,
                 '"message":{"delight_ranges"',
                 '"},"message_preferred_body"'
-            ).rsplit('],"text":"', 1)[-1]),
+            ).rsplit('],"text":"', 1)[-1],
             "date": self.parse_timestamp(
                 text.extr(photo_page, '\\"publish_time\\":', ',') or
                 text.extr(photo_page, '"created_time":', ',')
             ),
-            "url": self.decode_all(text.extr(
+            "url": self._decode_url(text.extr(
                 photo_page, ',"image":{"uri":"', '","'
             )),
             "next_photo_id": text.extr(
@@ -414,9 +430,9 @@ class FacebookExtractor(Extractor):
             "id": text.extr(
                 video_page, '\\"video_id\\":\\"', '\\"'
             ),
-            "username": self.decode_all(text.extr(
+            "username": text.extr(
                 video_page, '"actors":[{"__typename":"User","name":"', '","'
-            )),
+            ) or "",
             "user_id": text.extr(
                 video_page, '"owner":{"__typename":"User","id":"', '"'
             ),
@@ -427,11 +443,11 @@ class FacebookExtractor(Extractor):
         }
 
         if not video["username"]:
-            video["username"] = self.decode_all(text.extr(
+            video["username"] = text.extr(
                 video_page,
                 '"__typename":"User","id":"' + video["user_id"] + '","name":"',
                 '","'
-            ))
+            ) or ""
 
         first_video_raw = text.extr(
             video_page, '"permalink_url"', '\\/Period>\\u003C\\/MPD>'
@@ -439,7 +455,7 @@ class FacebookExtractor(Extractor):
 
         audio = {
             **video,
-            "url": self.decode_all(text.extr(
+            "url": self._decode_url(text.extr(
                 text.extr(
                     first_video_raw,
                     "AudioChannelConfiguration",
@@ -456,7 +472,7 @@ class FacebookExtractor(Extractor):
             first_video_raw, 'FBQualityLabel=\\"', '\\u003C\\/BaseURL>'
         ):
             resolution = raw_url.split('\\"', 1)[0]
-            video["urls"][resolution] = self.decode_all(
+            video["urls"][resolution] = self._decode_url(
                 raw_url.split('BaseURL>', 1)[1]
             )
 
@@ -538,6 +554,7 @@ class FacebookExtractor(Extractor):
             else:
                 retries = 0
                 photo.update(set_data)
+                self._decode_metadata(photo)
                 yield Message.Directory, "", photo
                 yield Message.Url, photo["url"], photo
 
@@ -623,11 +640,11 @@ class FacebookExtractor(Extractor):
             ]
 
             if bio := text.extr(page, '"best_description":{"text":"', '"'):
-                user["biography"] = self.decode_all(bio)
+                user["biography"] = bio
             elif (pos := page.find(
                     '"__module_operation_ProfileCometTileView_profileT')) >= 0:
-                user["biography"] = self.decode_all(text.rextr(
-                    page, '"text":"', '"', pos))
+                user["biography"] = text.rextr(
+                    page, '"text":"', '"', pos) or ""
             else:
                 user["biography"] = text.unescape(text.remove_html(text.extr(
                     page, "</span></span></h2>", "<ul>")))
@@ -705,15 +722,24 @@ class FacebookPostExtractor(FacebookExtractor):
                 directory["set_id"] = photo_data.get("set_id", "")
                 directory["title"] = photo_data.get("title", "")
 
+        self._decode_metadata(directory)
+
+        # Decode replies for JSON output
+        for reply in replies:
+            for rkey in ("text", "author"):
+                val = reply.get(rkey)
+                if isinstance(val, str) and val:
+                    reply[rkey] = self._safe_decode(val)
+
         yield Message.Directory, "", directory
 
         # Dump post content as JSON file
         content = json.dumps({
             "post_id"    : post_id,
             "user_id"    : owner_id,
-            "username"   : username,
+            "username"   : directory["username"],
             "post_pfbid" : post_pfbid,
-            "body"       : body,
+            "body"       : directory["body"],
             "replies"    : replies,
         }, ensure_ascii=False, indent=2)
         yield Message.Url, "text:" + content, {
@@ -729,6 +755,7 @@ class FacebookPostExtractor(FacebookExtractor):
                 post_page, directory, own_token)
         elif photo_data:
             photo_data.update(directory)
+            self._decode_metadata(photo_data)
             yield Message.Url, photo_data["url"], photo_data
 
     def _post_photos_multi(self, post_page, directory, set_token):
@@ -864,6 +891,8 @@ class FacebookPhotoExtractor(FacebookExtractor):
             elif not photo.get(key):
                 photo[key] = directory.get(key)
 
+        self._decode_metadata(directory)
+        self._decode_metadata(photo)
         yield Message.Directory, "", directory
         yield Message.Url, photo["url"], photo
 
@@ -927,6 +956,8 @@ class FacebookVideoExtractor(FacebookExtractor):
         if "url" not in video:
             return
 
+        self._decode_metadata(video)
+        self._decode_metadata(audio)
         yield Message.Directory, "", video
 
         if self.videos == "ytdl":
@@ -946,6 +977,7 @@ class FacebookInfoExtractor(FacebookExtractor):
 
     def items(self):
         user = self.cache(self._extract_profile, self.groups[0])
+        self._decode_metadata(user)
         return iter(((Message.Directory, "", user),))
 
 
@@ -1045,6 +1077,7 @@ class FacebookAvatarExtractor(FacebookExtractor):
                 "type" : "avatar",
             })
 
+        self._decode_metadata(directory)
         yield Message.Directory, "", directory
         yield Message.Url, avatar["url"], avatar
 
