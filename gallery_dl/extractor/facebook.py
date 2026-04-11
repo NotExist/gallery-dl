@@ -74,8 +74,8 @@ class FacebookExtractor(Extractor):
         return data
 
     def _decode_url(self, url_text):
-        """Minimal decode for URL fields — only unescape slashes."""
-        return url_text.replace("\\/", "/")
+        """Minimal decode for URL fields — unescape slashes and entities."""
+        return url_text.replace("\\/", "/").replace("&amp;", "&")
 
     def _decode_creation_story_id(self, encoded):
         """Decode the base64 'creation_story.id' value.
