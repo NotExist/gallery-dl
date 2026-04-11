@@ -283,17 +283,30 @@ class FacebookExtractor(Extractor):
                 continue
             body_text = section[ts:te]
 
-            # author name — search backward up to 2 KB
-            ctx = section[max(0, pos - 2048):pos]
-            ni = ctx.rfind('"name":"')
+            # author — search FORWARD for the "author" block that
+            # FB places AFTER the body in its relay-style HTML
+            fwd = section[te:te + 5000]
             author = ""
-            if ni >= 0:
-                ns = ni + 8
-                ne = ctx.find('"', ns)
-                if ne > ns:
-                    author = ctx[ns:ne]
+            author_id = ""
+            author_needle = '"author":{"__typename":"User","id":"'
+            ai = fwd.find(author_needle)
+            if ai >= 0:
+                id_start = ai + len(author_needle)
+                id_end = fwd.find('"', id_start)
+                if id_end > id_start:
+                    author_id = fwd[id_start:id_end]
+                ni = fwd.find('"name":"', id_end)
+                if ni >= 0 and ni - ai < 200:
+                    ns = ni + 8
+                    ne = fwd.find('"', ns)
+                    if ne > ns:
+                        author = fwd[ns:ne]
 
-            replies.append({"author": author, "text": body_text})
+            replies.append({
+                "author": author,
+                "author_id": author_id,
+                "text": body_text,
+            })
 
         return replies
 
@@ -658,7 +671,7 @@ class FacebookExtractor(Extractor):
 class FacebookPostExtractor(FacebookExtractor):
     """Extractor for Facebook Post pages"""
     subcategory = "post"
-    directory_fmt = ("{category}", "{username}", "{post_id}")
+    directory_fmt = ("{category}", "{username} ({user_id})", "{post_id}")
     filename_fmt = "{id}.{extension}"
     archive_fmt = "{post_id}_{id}.{extension}"
     pattern = BASE_PATTERN + r"/[^/?#]+/posts/([^/?#]+)"
