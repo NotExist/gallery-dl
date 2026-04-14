@@ -162,10 +162,17 @@ class FacebookExtractor(Extractor):
     def _find_owner_context(self, page, owner_hint):
         """Search the page HTML near owner_hint occurrences for post data.
 
-        Scans all positions where owner_hint appears and checks a
-        ±4 KB window around each for:
-          mediaset_token, post_id, body (message text),
-          owner_uid (numeric), owner_name (display name).
+        Two-pass scan:
+          1. Scan using the given hint (vanity or numeric uid).
+             Also resolves vanity → numeric uid if the hint is a
+             vanity string.
+          2. If pass 1 resolved a uid that differs from the hint
+             (vanity case) and not all fields were found, scan a
+             second time using the uid as anchor. This catches
+             cases where the vanity only appears in profile-link
+             sections of the HTML while the actual post content
+             (mediaset_token, photo nodes, message body) is near
+             occurrences of the numeric uid.
 
         Returns a dict of found fields (first find wins per field)
         plus '_owner_pos' — the byte offset where post_id was found,
@@ -174,12 +181,29 @@ class FacebookExtractor(Extractor):
         if not owner_hint:
             return {}
 
-        RADIUS = 4096
         result = {}
+        self._scan_owner_windows(page, owner_hint, result)
+
+        uid = result.get("owner_uid")
+        if uid and uid != owner_hint and not all(k in result for k in (
+                "mediaset_token", "post_id", "body",
+        )):
+            self._scan_owner_windows(page, uid, result)
+
+        return result
+
+    def _scan_owner_windows(self, page, hint, result):
+        """Scan ±4KB windows around each occurrence of 'hint' in
+        'page' and populate 'result' with any fields found.
+
+        Updates 'result' in place. Early-exits when all tracked
+        fields are present.
+        """
+        RADIUS = 4096
         pos = -1
 
         while True:
-            pos = page.find(owner_hint, pos + 1)
+            pos = page.find(hint, pos + 1)
             if pos < 0:
                 break
 
@@ -219,12 +243,12 @@ class FacebookExtractor(Extractor):
 
             # owner_uid: resolve vanity → numeric user_id
             if "owner_uid" not in result:
-                if owner_hint.isdigit():
+                if hint.isdigit():
                     # Numeric hint IS the user_id
-                    result["owner_uid"] = owner_hint
+                    result["owner_uid"] = hint
                 else:
                     # Vanity resolution via '/<vanity>","id":"<uid>"'
-                    vn = 'facebook.com\\/' + owner_hint + '","id":"'
+                    vn = 'facebook.com\\/' + hint + '","id":"'
                     vi = chunk.find(vn)
                     if vi >= 0:
                         vs = vi + len(vn)
@@ -250,8 +274,6 @@ class FacebookExtractor(Extractor):
                 "owner_uid", "owner_name",
             )):
                 break
-
-        return result
 
     def _extract_replies(self, page, owner_pos):
         """Extract pre-loaded replies from already-fetched HTML.
