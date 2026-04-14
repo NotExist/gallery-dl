@@ -392,9 +392,18 @@ class FacebookExtractor(Extractor):
             "url": self._decode_url(text.extr(
                 photo_page, ',"image":{"uri":"', '","'
             )),
+            # Try the legacy 'nextMediaAfterNodeId' field first
+            # (gives correct set-aware navigation for pcb.*/pb.*
+            # albums), fall back to the newer 'nextMedia.edges'
+            # structure used by FB for album types that no longer
+            # populate the legacy field (e.g., a.* user albums).
             "next_photo_id": text.extr(
                 photo_page,
                 '"nextMediaAfterNodeId":{"__typename":"Photo","id":"',
+                '"'
+            ) or text.extr(
+                photo_page,
+                '"nextMedia":{"edges":[{"node":{"__typename":"Photo","id":"',
                 '"'
             )
         }
@@ -944,7 +953,14 @@ class FacebookSetExtractor(FacebookExtractor):
         if not set_id:
             set_id = set_id2
 
-        if set_id.startswith("pcb."):
+        # Disable the jump-detection heuristic for post-bound
+        # (pcb.*) and user-album (a.*) sets — their photo ids
+        # can have large numeric gaps (FB snowflake IDs from
+        # different upload batches) that trigger false
+        # positives in 'next > id + i*120'. pb.* profile photo
+        # sets keep the heuristic since they're what it was
+        # designed to detect loops for.
+        if set_id.startswith(("pcb.", "a.")):
             self._detect_jump = False
 
         set_url = f"{self.root}/media/set/?set={set_id}"
