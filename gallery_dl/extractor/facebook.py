@@ -10,6 +10,7 @@ from .common import Extractor, Message, Dispatch
 from .. import text, util
 import binascii
 import json
+import re
 
 BASE_PATTERN = r"(?:https?://)?(?:[\w-]+\.)?facebook\.com"
 USER_PATTERN = (BASE_PATTERN +
@@ -383,7 +384,40 @@ class FacebookExtractor(Extractor):
                     set_page, '"userID":"', '"') or
                 directory["set_id"].split(".")[1])
 
+        # Build a {photo_id: url} fallback map from the set page.
+        # FB's newer layout embeds full photo URIs in the set page
+        # while the per-photo page only carries dimensions, so this
+        # map is the only source of URLs for those photos.
+        directory["_set_page_urls"] = self._extract_set_photo_urls(set_page)
+
         return directory
+
+    def _extract_set_photo_urls(self, set_page):
+        """Extract a {photo_id: url} map from a set page.
+
+        Two markup variants are handled:
+          1. uri before id: '"image":{...,"uri":"<url>"}...,"id":"<id>"'
+          2. id before uri: '"id":"<id>"...,"image":{...,"uri":"<url>"}'
+
+        Returns an empty dict if no entries found (older set pages
+        where photo URLs only live in per-photo pages).
+        """
+        urls = {}
+        # Variant 1: image (with uri) appears before id
+        for m in re.finditer(
+            r'"__typename":"Photo","__isMedia":"Photo","image":'
+            r'\{[^}]*"uri":"([^"]+)"[^}]*\}[^}]{0,200}?"id":"(\d+)"',
+            set_page,
+        ):
+            urls.setdefault(m.group(2), self._decode_url(m.group(1)))
+        # Variant 2: id appears before image
+        for m in re.finditer(
+            r'"__typename":"Photo","__isMedia":"Photo","id":"(\d+)"'
+            r'[^}]{0,500}?"image":\{[^}]*"uri":"([^"]+)"',
+            set_page,
+        ):
+            urls.setdefault(m.group(1), self._decode_url(m.group(2)))
+        return urls
 
     def parse_photo_page(self, photo_page):
         photo = {
@@ -558,7 +592,26 @@ class FacebookExtractor(Extractor):
 
     def extract_set(self, set_data):
         set_id = set_data["set_id"]
-        all_photo_ids = [set_data["first_photo_id"]]
+        # Fallback URL map built by parse_set_page from the set
+        # page's bulk-loaded photo URIs (FB's newer layout omits
+        # the URI from per-photo pages).
+        set_page_urls = set_data.get("_set_page_urls") or {}
+
+        # When the set page already provided a complete photo
+        # list, use it as the canonical iteration source. The
+        # newer per-photo page layout often omits 'next_photo_id'
+        # entirely, so chain-walking would stop at the first
+        # photo. The existing loop / jump / next_photo_id logic
+        # below remains a no-op when all ids are pre-populated.
+        if set_page_urls:
+            all_photo_ids = list(set_page_urls)
+            first_pid = set_data.get("first_photo_id")
+            if first_pid and first_pid in set_page_urls and \
+                    all_photo_ids[0] != first_pid:
+                all_photo_ids.remove(first_pid)
+                all_photo_ids.insert(0, first_pid)
+        else:
+            all_photo_ids = [set_data["first_photo_id"]]
 
         retries = 0
         i = 0
@@ -571,6 +624,17 @@ class FacebookExtractor(Extractor):
             photo = self.parse_photo_page(photo_page)
             photo["num"] = i + 1
 
+            # If the photo page didn't carry the image URI, fall
+            # back to the set page's pre-extracted map.
+            if not photo["url"] and photo_id in set_page_urls:
+                photo["url"] = set_page_urls[photo_id]
+                if not photo["id"]:
+                    photo["id"] = photo_id
+                # parse_photo_page already ran nameext_from_url on
+                # an empty url, so re-run it now to populate
+                # filename / extension from the actual url.
+                text.nameext_from_url(photo["url"], photo)
+
             if self.author_followups:
                 for followup_id in photo["followups_ids"]:
                     if followup_id not in all_photo_ids:
@@ -581,7 +645,7 @@ class FacebookExtractor(Extractor):
 
             if not photo["url"]:
                 if retries < self.fallback_retries and self._interval_429:
-                    seconds = self._interval_429()
+                    seconds = self._interval_429(retries)
                     self.log.warning(
                         "Failed to find photo download URL for %s. "
                         "Retrying in %s seconds.", photo_url, seconds,
