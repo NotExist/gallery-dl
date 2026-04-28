@@ -383,12 +383,23 @@ def _extract_nineyi_value(js, key):
     return ""
 
 
+_CMS_IMAGE_BASE = "https://cms-static.cdn.91app.com/images/original"
+
+# Keys (case-insensitive) under which a 91app widget attribute tree
+# stores a media filename.  Walked recursively in ``_walk_state_media``.
+_IMG_KEY_RE = re.compile(r"image[Uu]rl|imageURL", re.ASCII)
+
+
 class _91appPageExtractor(_91appExtractor):
     """Extractor for a 91app CMS landing page (``/page/<slug>``)
 
-    Best-effort SSR extraction.  React-rendered widget content is not
-    accessible to a pure HTTP client; the JSON sidecar carries
-    ``ssr_only=true`` to signal that the snapshot is partial.
+    Primary path: parse the inline ``nineyi['__PRELOADED_STATE__']``
+    widget tree (``construct.{header,center,footer}``) and yield every
+    image referenced by a widget attribute.  Each material lives at
+    ``cms-static.cdn.91app.com/images/original/<shop_id>/<filename>``.
+
+    Fallback (no preloaded state): scrape ``<img>`` from the SSR shell
+    and tag the snapshot ``ssr_only=true``.
     """
     subcategory = "page"
     directory_fmt = ("{category}", "page", "{page_slug}")
@@ -396,23 +407,36 @@ class _91appPageExtractor(_91appExtractor):
     pattern = BASE_PATTERN + r"/page/([\w.-]+)"
     example = "91app:https://example.com/page/some-page"
 
+    def _init(self):
+        super()._init()
+        self._follow_links = self.config("follow-links", False)
+        self._include_state = self.config("state", True)
+
     def items(self):
         slug = self.groups[-1]
         url = f"{self.root}/page/{slug}"
         page = self.request(url, notfound="page").text
 
         meta = self._extract_page_meta(page, slug)
-        media = self._collect_media(page)
+        state = self._extract_preloaded_state(page)
+
+        if state is not None:
+            media_items = self._walk_state_media(state, meta["shop_id"])
+            linked = self._collect_linked_salepages(state)
+            meta["ssr_only"] = False
+            meta["widget_count"] = self._widget_count(state)
+            meta["linked_salepage_ids"] = sorted(linked)
+        else:
+            media_items = self._media_from_ssr(page)
+            meta["ssr_only"] = True
+            meta["note"] = (
+                "nineyi['__PRELOADED_STATE__'] not found; falling back "
+                "to SSR <img> scrape. Some widget content may be missing.")
 
         snapshot = dict(meta)
-        snapshot["images"] = list(media)
-        snapshot["ssr_only"] = True
-        snapshot["note"] = (
-            "Widget content on 91app CMS pages is rendered client-side "
-            "from a non-public CMS API. This snapshot is limited to "
-            "what's in the SSR HTML shell (logo, breadcrumb, og-meta, "
-            "any cms-static images baked in by the theme). Full widget "
-            "media requires a headless browser.")
+        snapshot["media"] = media_items
+        if state is not None and self._include_state:
+            snapshot["state"] = state
 
         yield Message.Directory, "", meta
 
@@ -428,12 +452,21 @@ class _91appPageExtractor(_91appExtractor):
                 "extension": "json",
             }
 
-        for num, img_url in enumerate(media, 1):
+        for num, item in enumerate(media_items, 1):
             kw = dict(meta)
             kw["num"] = num
-            kw["filename"] = f"{num:02d}"
-            kw["extension"] = self._ext_for_media(img_url)
-            yield Message.Url, img_url, kw
+            stem = item.get("item_key") or item.get("material_key") or ""
+            kw["filename"] = (f"{num:03d}_{stem}"
+                              if stem else f"{num:03d}")
+            kw["extension"] = self._ext_for_media(
+                item.get("filename") or item.get("url") or "")
+            yield Message.Url, item["url"], kw
+
+        if self._follow_links and state is not None:
+            for sp_id in sorted(self._collect_linked_salepages(state)):
+                target = f"{self.root}/SalePage/Index/{sp_id}"
+                yield Message.Queue, f"91app:{target}", {
+                    "page": dict(meta), "salepage_id": sp_id}
 
     # ------------------------------------------------------------------ #
     # SSR extraction
@@ -542,9 +575,164 @@ class _91appPageExtractor(_91appExtractor):
                 ]
         return []
 
-    def _collect_media(self, html):
+    # ------------------------------------------------------------------ #
+    # PRELOADED_STATE extraction (primary path)
+    # ------------------------------------------------------------------ #
+    def _extract_preloaded_state(self, html):
+        """Locate ``nineyi['__PRELOADED_STATE__'] = {…};`` and parse it."""
+        m = re.search(
+            r"""nineyi\[\s*['"]__PRELOADED_STATE__['"]\s*\]\s*=\s*""",
+            html)
+        if not m:
+            return None
+        i = m.end()
+        # Whitespace
+        while i < len(html) and html[i] in ' \t\n\r':
+            i += 1
+        if i >= len(html) or html[i] != '{':
+            return None
+        # Balanced-brace parse with string awareness
+        depth = 0
+        in_str = False
+        esc = False
+        quote = None
+        for j in range(i, len(html)):
+            c = html[j]
+            if esc:
+                esc = False
+                continue
+            if in_str:
+                if c == '\\':
+                    esc = True
+                elif c == quote:
+                    in_str = False
+                continue
+            if c in '"\'':
+                in_str = True
+                quote = c
+                continue
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    raw = html[i:j + 1]
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+    @staticmethod
+    def _widget_count(state):
+        construct = state.get("construct") or {}
+        return {
+            region: len(construct.get(region) or ())
+            for region in ("header", "center", "footer")
+        }
+
+    def _walk_state_media(self, state, shop_id):
+        """Yield one entry per imageUrl* leaf in the widget tree.
+
+        Each entry::
+
+            {
+                "filename"     : str,
+                "url"          : str,                 # full CDN URL
+                "field"        : str (e.g. "imageUrl")
+                "path"         : str (.construct.center[3]…)
+                "section"      : "header"|"center"|"footer",
+                "module_index" : int,
+                "widget_id"    : str,
+                "item_key"     : str,
+                "material_key" : str,
+                "link_url"     : str,
+                "link_info"    : dict | None,
+            }
+        """
+        items = []
         seen = set()
-        urls = []
+        construct = state.get("construct") or {}
+        for section in ("header", "center", "footer"):
+            for w in construct.get(section) or ():
+                if not isinstance(w, dict):
+                    continue
+                idx = w.get("moduleIndex", 0)
+                wid = w.get("id", "")
+                attrs = w.get("attributes") or {}
+                self._collect_widget(
+                    attrs, items, seen, shop_id,
+                    section=section, module_index=idx, widget_id=wid,
+                    path=f".construct.{section}[{idx}]")
+        return items
+
+    def _collect_widget(self, node, out, seen, shop_id, *,
+                        section, module_index, widget_id, path,
+                        material_key="", item_key="",
+                        link_url="", link_info=None):
+        if isinstance(node, dict):
+            mk = node.get("materialKey") or material_key
+            ik = node.get("itemKey") or item_key
+            lu = node.get("linkUrl") or link_url
+            li = node.get("linkInfo") if isinstance(
+                node.get("linkInfo"), dict) else link_info
+            for k, v in node.items():
+                if isinstance(v, str) and _IMG_KEY_RE.search(k):
+                    if not v or v in seen:
+                        continue
+                    seen.add(v)
+                    url = f"{_CMS_IMAGE_BASE}/{shop_id}/{v}" if shop_id else ""
+                    out.append({
+                        "filename"     : v,
+                        "url"          : url,
+                        "field"        : k,
+                        "path"         : path + "." + k,
+                        "section"      : section,
+                        "module_index" : module_index,
+                        "widget_id"    : widget_id,
+                        "item_key"     : ik or "",
+                        "material_key" : mk or "",
+                        "link_url"     : lu or "",
+                        "link_info"    : li,
+                    })
+                else:
+                    self._collect_widget(
+                        v, out, seen, shop_id,
+                        section=section, module_index=module_index,
+                        widget_id=widget_id,
+                        path=path + "." + k,
+                        material_key=mk, item_key=ik,
+                        link_url=lu, link_info=li)
+        elif isinstance(node, list):
+            for i, x in enumerate(node):
+                self._collect_widget(
+                    x, out, seen, shop_id,
+                    section=section, module_index=module_index,
+                    widget_id=widget_id,
+                    path=f"{path}[{i}]",
+                    material_key=material_key, item_key=item_key,
+                    link_url=link_url, link_info=link_info)
+
+    @staticmethod
+    def _collect_linked_salepages(state):
+        ids = set()
+        raw = json.dumps(state, ensure_ascii=False)
+        for m in re.finditer(r'/SalePage/Index/(\d+)', raw):
+            ids.add(int(m.group(1)))
+        return ids
+
+    # ------------------------------------------------------------------ #
+    # SSR fallback (when PRELOADED_STATE is missing)
+    # ------------------------------------------------------------------ #
+    def _media_from_ssr(self, html):
+        """Walk the SSR HTML for visible <img> sources.
+
+        Returns a list shaped like the state-walker output (so JSON
+        consumers see a uniform schema), but only ``filename`` / ``url``
+        / ``field=`ssr_img``` are populated.
+        """
+        seen = set()
+        out = []
         for tag in text.extract_iter(html, "<img", ">"):
             src = (text.extr(tag, 'src="', '"') or
                    text.extr(tag, "src='", "'") or
@@ -561,19 +749,38 @@ class _91appPageExtractor(_91appExtractor):
             if src in seen:
                 continue
             seen.add(src)
-            urls.append(src)
-        # og:image as fallback / supplement
+            out.append({
+                "filename"     : src.rsplit("/", 1)[-1],
+                "url"          : src,
+                "field"        : "ssr_img",
+                "path"         : "",
+                "section"      : "",
+                "module_index" : 0,
+                "widget_id"    : "",
+                "item_key"     : "",
+                "material_key" : "",
+                "link_url"     : "",
+                "link_info"    : None,
+            })
         og_img = text.extr(
             html, '<meta property="og:image" content="', '"')
         if og_img:
             og_img = text.unescape(og_img)
             if og_img.startswith("//"):
                 og_img = "https:" + og_img
-            if og_img not in seen and og_img.startswith(
+            if og_img and og_img not in seen and og_img.startswith(
                     ("http://", "https://")):
                 seen.add(og_img)
-                urls.append(og_img)
-        return urls
+                out.append({
+                    "filename": og_img.rsplit("/", 1)[-1],
+                    "url": og_img,
+                    "field": "og_image", "path": "",
+                    "section": "", "module_index": 0,
+                    "widget_id": "", "item_key": "",
+                    "material_key": "", "link_url": "",
+                    "link_info": None,
+                })
+        return out
 
     @staticmethod
     def _ext_for_media(url):
