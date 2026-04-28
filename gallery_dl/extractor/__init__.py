@@ -41,6 +41,7 @@ modules = [
     "boosty",
     "booth",
     "bunkr",
+    "bunnystream",
     "catbox",
     "cfake",
     "chevereto",
