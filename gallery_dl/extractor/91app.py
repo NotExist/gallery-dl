@@ -8,31 +8,45 @@
 
 91app powers a large family of Taiwan-based e-commerce sites
 (``www.qmomo.com.tw``, ``www.peachjohn.com.tw``, ``www.miniqueen.tw`` …).
-Their product (SalePage) URLs all follow ``<host>/SalePage/Index/<id>``
-and the rendered HTML embeds the full product data inline as
-``window.ServerRenderData["SalePageIndexViewModel"] = {…}`` — that
-single JSON blob feeds this extractor.
+Two URL flavors are supported:
+
+* ``<host>/SalePage/Index/<id>`` — product detail pages.  The
+  rendered HTML embeds the full view-model inline as
+  ``window.ServerRenderData["SalePageIndexViewModel"] = {…}`` — that
+  single JSON blob feeds the product extractor.
+* ``<host>/page/<slug>`` — CMS landing / campaign pages.  These are
+  React SPAs whose widget content is fetched client-side from a
+  non-public 91app CMS API; pure HTTP can only see what's in the SSR
+  shell (shop info, breadcrumb, og-meta, occasional cms-static
+  assets).  The page extractor records that and writes a timestamped
+  JSON snapshot, but full widget media requires a headless browser.
 
 This module is site-agnostic and ships with **no** instances
 pre-registered.  Reach a 91app shop via either:
 
-* the ``91app:<host-url>/SalePage/Index/<id>`` URL prefix, or
+* the ``91app:<host-url>/<path>`` URL prefix, or
 * a per-site entry under ``extractor.91app.<category>`` in your
   gallery-dl config (see the snippet at the bottom of this file).
 
-What gets extracted:
+Product extractor (``subcategory=product``) yields:
 
-* All ``ImageList[].PicUrl`` images (img.91app.com CDN)
-* A UTC-timestamped JSON sidecar per run, mirroring the amiami pattern,
-  so re-running the same product accumulates a price/stock/promotion
-  history without overwriting earlier snapshots
-* Any external media referenced from the description fields or from
+* all ``ImageList[].PicUrl`` images (img.91app.com CDN)
+* a UTC-timestamped JSON sidecar per run, mirroring the amiami
+  pattern, so re-running the same product accumulates a
+  price/stock/promotion history without overwriting earlier snapshots
+* any external media from description bodies or
   ``MainImageVideo.VideoUrl`` (typically YouTube product videos or
-  91app CMS-static images).  These are recorded under
-  ``external_media`` in the JSON and yielded as ``Message.Queue`` so
-  whichever sibling extractor matches the URL pattern (or yt-dlp via
-  ``ytdl:`` configuration) picks them up; they download to that
-  extractor's own directory tree, not the 91app one.
+  91app CMS-static images), recorded under ``external_media`` in the
+  JSON and yielded as ``Message.Queue`` for sibling extractors
+
+Page extractor (``subcategory=page``) yields:
+
+* whatever images are visible in the SSR HTML (typically the shop logo
+  and any cms-static assets baked in by the theme — *not* React-rendered
+  widget content)
+* a UTC-timestamped JSON sidecar with ``shop_id`` / ``page_slug`` /
+  ``page_type`` / ``breadcrumb`` / og-meta + a ``ssr_only`` flag set
+  ``true`` so callers know the snapshot is partial
 
 Settings (under ``extractor.91app.*``)::
 
@@ -50,8 +64,6 @@ Out of scope:
 
 * SHOPLINE-based shops (e.g. ``www.uwlingerie.com``) use a different
   platform; need their own extractor
-* 91app CMS landing pages (``<host>/page/<slug>``) — editorial pages,
-  not product SalePages
 """
 
 import re
@@ -307,3 +319,267 @@ class _91appProductExtractor(_91appExtractor):
             "fetched_at"          : datetime.datetime.now(
                 datetime.timezone.utc).isoformat(),
         }
+
+
+# Pulls the inline ``nineyi.<key> = <value>;`` assignments out of the
+# 91app SSR shell.  Used by the page extractor below — these blocks
+# carry shop info, locale, page type and the API config but NOT the
+# widget data (that is fetched client-side from a non-public CMS API).
+def _extract_nineyi_value(js, key):
+    """Return the raw text of ``nineyi.<key> = <value>;`` or ``""``."""
+    m = re.search(
+        rf'nineyi\.{re.escape(key)}\s*=\s*', js)
+    if not m:
+        return ""
+    i = m.end()
+    while i < len(js) and js[i] in ' \t\n\r':
+        i += 1
+    if i >= len(js):
+        return ""
+    c = js[i]
+    if c not in '{["\'':
+        j = js.find(';', i)
+        return js[i:j].strip() if j > 0 else ""
+    if c in '{[':
+        depth = 0
+        in_str = False
+        esc = False
+        quote = None
+        for j in range(i, len(js)):
+            cc = js[j]
+            if esc:
+                esc = False
+                continue
+            if in_str:
+                if cc == '\\':
+                    esc = True
+                elif cc == quote:
+                    in_str = False
+                continue
+            if cc in '"\'':
+                in_str = True
+                quote = cc
+                continue
+            if cc in '{[':
+                depth += 1
+            elif cc in '}]':
+                depth -= 1
+                if depth == 0:
+                    return js[i:j + 1]
+        return ""
+    # Quoted scalar
+    quote = c
+    esc = False
+    for j in range(i + 1, len(js)):
+        cc = js[j]
+        if esc:
+            esc = False
+            continue
+        if cc == '\\':
+            esc = True
+            continue
+        if cc == quote:
+            return js[i:j + 1]
+    return ""
+
+
+class _91appPageExtractor(_91appExtractor):
+    """Extractor for a 91app CMS landing page (``/page/<slug>``)
+
+    Best-effort SSR extraction.  React-rendered widget content is not
+    accessible to a pure HTTP client; the JSON sidecar carries
+    ``ssr_only=true`` to signal that the snapshot is partial.
+    """
+    subcategory = "page"
+    directory_fmt = ("{category}", "page", "{page_slug}")
+    archive_fmt = "{page_slug}_{filename}.{extension}"
+    pattern = BASE_PATTERN + r"/page/([\w.-]+)"
+    example = "91app:https://example.com/page/some-page"
+
+    def items(self):
+        slug = self.groups[-1]
+        url = f"{self.root}/page/{slug}"
+        page = self.request(url, notfound="page").text
+
+        meta = self._extract_page_meta(page, slug)
+        media = self._collect_media(page)
+
+        snapshot = dict(meta)
+        snapshot["images"] = list(media)
+        snapshot["ssr_only"] = True
+        snapshot["note"] = (
+            "Widget content on 91app CMS pages is rendered client-side "
+            "from a non-public CMS API. This snapshot is limited to "
+            "what's in the SSR HTML shell (logo, breadcrumb, og-meta, "
+            "any cms-static images baked in by the theme). Full widget "
+            "media requires a headless browser.")
+
+        yield Message.Directory, "", meta
+
+        if self._write_metadata:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y%m%dT%H%M%SZ")
+            payload = json.dumps(
+                snapshot, ensure_ascii=False, indent=2, default=str)
+            yield Message.Url, "text:" + payload, {
+                **meta,
+                "num"      : 0,
+                "filename" : ts,
+                "extension": "json",
+            }
+
+        for num, img_url in enumerate(media, 1):
+            kw = dict(meta)
+            kw["num"] = num
+            kw["filename"] = f"{num:02d}"
+            kw["extension"] = self._ext_for_media(img_url)
+            yield Message.Url, img_url, kw
+
+    # ------------------------------------------------------------------ #
+    # SSR extraction
+    # ------------------------------------------------------------------ #
+    def _extract_page_meta(self, html, slug):
+        # Concatenate inline scripts so _extract_nineyi_value can search
+        # without us preserving exact <script> boundaries.
+        scripts = "\n".join(text.extract_iter(html, "<script", "</script>"))
+
+        shop_id = text.parse_int(
+            _extract_nineyi_value(scripts, "shopId"))
+        page_type = _extract_nineyi_value(
+            scripts, "pageType").strip("'\" ")
+        view_id = _extract_nineyi_value(
+            scripts, "viewId").strip("'\" ")
+        silo = _extract_nineyi_value(scripts, "silo").strip("'\" ")
+
+        # nineyi.dependencies carries shop name + locale + apiConfig
+        deps_raw = _extract_nineyi_value(scripts, "dependencies")
+        shop_name = ""
+        shop_domain = ""
+        locale = ""
+        market = ""
+        page_name = ""
+        router_path = ""
+        if deps_raw:
+            try:
+                deps = json.loads(deps_raw)
+            except Exception:
+                deps = {}
+            shop_domain = deps.get("shopDomainName") or ""
+            locale = deps.get("locale") or ""
+            market = deps.get("market") or ""
+            page_name = deps.get("pageName") or ""
+            router_path = deps.get("routerPath") or ""
+            sp = deps.get("shopProfile") or {}
+            sbi = (sp.get("ShopBasicInfo") or {}) if isinstance(
+                sp, dict) else {}
+            shop_name = sbi.get("ShopName") or ""
+
+        og = self._og(html)
+        breadcrumb = self._breadcrumb(html)
+
+        return {
+            "category"      : self.category,
+            "subcategory"   : self.subcategory,
+            # Identifiers
+            "page_slug"     : router_path or slug,
+            "page_name"     : page_name or "",
+            "page_type"     : page_type,
+            "view_id"       : view_id,
+            "silo"          : silo,
+            "shop_id"       : shop_id,
+            "shop_name"     : shop_name,
+            "shop_domain"   : shop_domain,
+            "locale"        : locale,
+            "market"        : market,
+            "url"           : f"{self.root}/page/{slug}",
+            # SSR-visible content
+            "og_title"      : og.get("title", ""),
+            "og_description": og.get("description", ""),
+            "og_image"      : og.get("image", ""),
+            "og_url"        : og.get("url", ""),
+            "og_type"       : og.get("type", ""),
+            "page_title"    : self._title(html),
+            "breadcrumb"    : breadcrumb,
+            # Fetch timestamp
+            "fetched_at"    : datetime.datetime.now(
+                datetime.timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _og(html):
+        out = {}
+        for tag in text.extract_iter(html, "<meta", ">"):
+            prop = text.extr(tag, 'property="og:', '"')
+            if not prop:
+                continue
+            content = text.extr(tag, 'content="', '"')
+            if content:
+                out[prop] = text.unescape(content)
+        return out
+
+    @staticmethod
+    def _title(html):
+        t = text.extr(html, "<title>", "</title>")
+        return text.unescape(t).strip() if t else ""
+
+    @staticmethod
+    def _breadcrumb(html):
+        for block in text.extract_iter(
+                html, '<script type="application/ld+json">', '</script>'):
+            try:
+                data = json.loads(block.strip())
+            except Exception:
+                continue
+            if isinstance(data, dict) and \
+                    data.get("@type") == "BreadcrumbList":
+                return [
+                    {
+                        "position": text.parse_int(it.get("position")),
+                        "name"    : it.get("name") or "",
+                        "item"    : it.get("item") or "",
+                    }
+                    for it in (data.get("itemListElement") or [])
+                ]
+        return []
+
+    def _collect_media(self, html):
+        seen = set()
+        urls = []
+        for tag in text.extract_iter(html, "<img", ">"):
+            src = (text.extr(tag, 'src="', '"') or
+                   text.extr(tag, "src='", "'") or
+                   text.extr(tag, 'data-src="', '"'))
+            if not src or src.startswith("data:"):
+                continue
+            src = text.unescape(src)
+            if src.startswith("//"):
+                src = "https:" + src
+            if not src.startswith(("http://", "https://")):
+                continue
+            if any(d in src for d in _TRACKER_DOMAINS):
+                continue
+            if src in seen:
+                continue
+            seen.add(src)
+            urls.append(src)
+        # og:image as fallback / supplement
+        og_img = text.extr(
+            html, '<meta property="og:image" content="', '"')
+        if og_img:
+            og_img = text.unescape(og_img)
+            if og_img.startswith("//"):
+                og_img = "https:" + og_img
+            if og_img not in seen and og_img.startswith(
+                    ("http://", "https://")):
+                seen.add(og_img)
+                urls.append(og_img)
+        return urls
+
+    @staticmethod
+    def _ext_for_media(url):
+        path = url.partition("?")[0]
+        candidate = path.rpartition(".")[2].lower()
+        if candidate in ("jpg", "jpeg", "png", "gif", "webp", "svg",
+                         "mp4", "webm"):
+            return candidate
+        return "jpg"
