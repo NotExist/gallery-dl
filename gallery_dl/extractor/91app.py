@@ -48,16 +48,26 @@ Page extractor (``subcategory=page``) yields:
   ``page_type`` / ``breadcrumb`` / og-meta + a ``ssr_only`` flag set
   ``true`` so callers know the snapshot is partial
 
-Settings (under ``extractor.91app.*``)::
+Settings::
 
-    "metadata"  : true   # write the timestamped JSON sidecar
-    "externals" : true   # forward external-media URLs as Message.Queue
+    "metadata"     : true    # write the timestamped JSON sidecar
+    "externals"    : true    # forward external-media URLs
+    "follow-group" : false   # queue SalePageGroup sibling variants
 
-User config to register a shop without using the prefix::
+``metadata`` and ``externals`` are read via ``self.config()`` — place
+them at the root ``extractor.<key>`` (covers every extractor) or under
+a per-shop ``extractor.<category>.<key>`` to override.
+
+``follow-group`` is per-shop policy and lives directly in the instance
+dict (same dict as ``root`` / ``pattern``); it is read via
+``self.config_instance()``, mirroring mastodon's ``access-token``.
+
+User config to register a shop and enable per-instance settings::
 
     {"extractor": {"91app": {"qmomo": {
-        "root":    "https://www.qmomo.com.tw",
-        "pattern": r"(?:www\\.)?qmomo\\.com\\.tw"
+        "root":         "https://www.qmomo.com.tw",
+        "pattern":      r"(?:www\\.)?qmomo\\.com\\.tw",
+        "follow-group": true
     }}}}
 
 Out of scope:
@@ -71,7 +81,7 @@ import json
 import datetime
 
 from .common import BaseExtractor, Message
-from .. import text, config
+from .. import text
 
 
 _VIEWMODEL_RE = re.compile(
@@ -101,24 +111,12 @@ class _91appExtractor(BaseExtractor):
     archive_fmt = "{salepage_id}_{filename}.{extension}"
 
     def _init(self):
-        self._write_metadata = self._bc_config("metadata", True)
-        self._yield_externals = self._bc_config("externals", True)
-        self._follow_group = self._bc_config("follow-group", False)
-
-    def _bc_config(self, key, default):
-        """Read a setting, falling back to ``extractor.<basecategory>.<key>``.
-
-        BaseExtractor's per-instance cfgpath is
-        ``("extractor", <category>, <subcategory>)``, so plain
-        ``self.config(key)`` never visits ``extractor.<basecategory>``.
-        91app users naturally want to set ``extractor.91app.<setting>`` to
-        cover all instances — this helper bridges that gap.
-        """
-        val = self.config(key)
-        if val is None:
-            val = config.interpolate(
-                ("extractor", self.basecategory), key, default)
-        return val
+        self._write_metadata = self.config("metadata", True)
+        self._yield_externals = self.config("externals", True)
+        # config_instance (cf. mastodon's access-token) so the flag can
+        # ride in the instance dict; self.config() only walks
+        # extractor.<category>.<subcategory> and misses it there.
+        self._follow_group = self.config_instance("follow-group", False)
 
 
 # No instances pre-registered: see module docstring for usage.
