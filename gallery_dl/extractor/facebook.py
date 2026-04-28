@@ -8,6 +8,9 @@
 
 from .common import Extractor, Message, Dispatch
 from .. import text, util
+import binascii
+import json
+import re
 
 BASE_PATTERN = r"(?:https?://)?(?:[\w-]+\.)?facebook\.com"
 USER_PATTERN = (BASE_PATTERN +
@@ -38,11 +41,308 @@ class FacebookExtractor(Extractor):
         self.author_followups = self.config("author-followups", False)
         self._detect_jump = True
 
-    def decode_all(self, txt):
-        return text.unescape(
-            txt.encode().decode("unicode_escape")
-            .encode("utf_16", "surrogatepass").decode("utf_16")
-        ).replace("\\/", "/")
+    def _safe_decode(self, txt):
+        """Decode FB's unicode-escaped text with error tolerance."""
+        try:
+            decoded = txt.encode().decode("unicode_escape") \
+                .encode("utf_16", "surrogatepass").decode("utf_16")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            decoded = txt
+        return text.unescape(decoded).replace("\\/", "/")
+
+    # backward-compat alias
+    decode_all = _safe_decode
+
+    def _decode_metadata(self, data):
+        """Decode unicode-escaped strings in a metadata dict.
+
+        Called once before yielding so only values that actually
+        reach output get decoded, avoiding redundant work during
+        the parse / search phase.
+        """
+        for key in ("username", "title", "caption", "body",
+                     "user_pfbid", "biography"):
+            val = data.get(key)
+            if isinstance(val, str) and val:
+                data[key] = self._safe_decode(val)
+
+        for reply in data.get("replies", ()):
+            for rkey in ("text", "author"):
+                val = reply.get(rkey)
+                if isinstance(val, str) and val:
+                    reply[rkey] = self._safe_decode(val)
+
+        return data
+
+    def _decode_url(self, url_text):
+        """Minimal decode for URL fields — unescape slashes and entities."""
+        return url_text.replace("\\/", "/").replace("&amp;", "&")
+
+    def _decode_creation_story_id(self, encoded):
+        """Decode the base64 'creation_story.id' value.
+
+        The encoded string decodes to 'S:_I<post_user_id>:<post_id>:<post_id>'
+        where both ids are stable numeric identifiers (independent of any
+        per-session 'pfbid' token). Returns (post_user_id, post_id) as
+        strings, or (None, None) on any failure.
+        """
+        try:
+            decoded = binascii.a2b_base64(encoded + "==").decode()
+        except Exception:
+            return None, None
+        parts = decoded.split(":")
+        if len(parts) >= 3 and parts[1].startswith("_I"):
+            return parts[1][2:], parts[2]
+        return None, None
+
+    def _extract_post_identity(self, page):
+        """Extract the canonical (post_user_id, post_id) of a post page.
+
+        A Facebook post page may embed multiple posts (sidebar, recommended,
+        cross-post sources). The first 'creation_story' block in the HTML
+        belongs to the page's own post. Decoding its 'id' field yields
+        clean numeric identifiers regardless of the URL form (vanity vs
+        numeric, pfbid vs numeric).
+
+        Returns (post_user_id, post_id) on success or (None, None) if no
+        creation_story block can be parsed.
+        """
+        block = text.extr(page, '"creation_story":{', '}')
+        if not block:
+            return None, None
+        token = text.extr(block, '"id":"', '"')
+        if not token:
+            return None, None
+        return self._decode_creation_story_id(token)
+
+    def _find_own_mediaset_token(self, page, post_id):
+        """Return 'pcb.<post_id>' if the page contains a mediaset_token
+        whose numeric part matches 'post_id', otherwise None.
+
+        For multi-photo posts, FB embeds the post's own set as
+        '"mediaset_token":"pcb.<numeric_post_id>"'. Other embedded posts
+        in the same HTML use their own (different) numeric ids, so an
+        exact match against 'post_id' unambiguously identifies the
+        post's own set without any byte-distance heuristic.
+        """
+        if not post_id:
+            return None
+        if page.find('"mediaset_token":"pcb.' + post_id + '"') >= 0:
+            return "pcb." + post_id
+        return None
+
+    def _extract_owner_username(self, page, post_user_id):
+        """Find the display name of the post owner (raw, not decoded)."""
+        if not post_user_id:
+            return ""
+        needle = '"id":"' + post_user_id + '"'
+        for actor in text.extract_iter(page, '"actors":[{', '}'):
+            if needle in actor:
+                return text.extr(actor, '"name":"', '"') or ""
+        return ""
+
+    def _extract_owner_hint(self, url):
+        """Extract an owner identifier from a URL.
+
+        Returns a string (numeric user_id or vanity) that can be
+        searched for in the page HTML to locate the owner's post
+        block. Returns '' if no hint can be derived.
+        """
+        # /<vanity_or_numeric>/posts/<token>
+        if "/posts/" in url:
+            return url.split("/posts/")[0].rsplit("/", 1)[-1]
+        # ?id=<numeric> or &id=<numeric> (may be last query param)
+        query = url.partition("?")[2]
+        if query:
+            params = text.parse_query(query)
+            val = params.get("id", "")
+            if val.isdigit():
+                return val
+        return ""
+
+    def _find_owner_context(self, page, owner_hint):
+        """Search the page HTML near owner_hint occurrences for post data.
+
+        Two-pass scan:
+          1. Scan using the given hint (vanity or numeric uid).
+             Also resolves vanity → numeric uid if the hint is a
+             vanity string.
+          2. If pass 1 resolved a uid that differs from the hint
+             (vanity case) and not all fields were found, scan a
+             second time using the uid as anchor. This catches
+             cases where the vanity only appears in profile-link
+             sections of the HTML while the actual post content
+             (mediaset_token, photo nodes, message body) is near
+             occurrences of the numeric uid.
+
+        Returns a dict of found fields (first find wins per field)
+        plus '_owner_pos' — the byte offset where post_id was found,
+        used to scope reply extraction.
+        """
+        if not owner_hint:
+            return {}
+
+        result = {}
+        self._scan_owner_windows(page, owner_hint, result)
+
+        uid = result.get("owner_uid")
+        if uid and uid != owner_hint and not all(k in result for k in (
+                "mediaset_token", "post_id", "body",
+        )):
+            self._scan_owner_windows(page, uid, result)
+
+        return result
+
+    def _scan_owner_windows(self, page, hint, result):
+        """Scan ±4KB windows around each occurrence of 'hint' in
+        'page' and populate 'result' with any fields found.
+
+        Updates 'result' in place. Early-exits when all tracked
+        fields are present.
+        """
+        RADIUS = 4096
+        pos = -1
+
+        while True:
+            pos = page.find(hint, pos + 1)
+            if pos < 0:
+                break
+
+            start = max(0, pos - RADIUS)
+            chunk = page[start:min(len(page), pos + RADIUS)]
+
+            # mediaset_token
+            if "mediaset_token" not in result:
+                needle = '"mediaset_token":"'
+                idx = chunk.find(needle)
+                if idx >= 0:
+                    vs = idx + len(needle)
+                    ve = chunk.find('"', vs)
+                    if ve > vs:
+                        result["mediaset_token"] = chunk[vs:ve]
+
+            # post_id
+            if "post_id" not in result:
+                needle = '"post_id":"'
+                idx = chunk.find(needle)
+                if idx >= 0:
+                    vs = idx + len(needle)
+                    ve = chunk.find('"', vs)
+                    if ve > vs and chunk[vs:ve].isdigit():
+                        result["post_id"] = chunk[vs:ve]
+                        result["_owner_pos"] = pos
+
+            # body (message text — NOT "body":{"text"} which is comments)
+            if "body" not in result:
+                mi = chunk.find('"message":{')
+                if mi >= 0:
+                    ti = chunk.find('"text":"', mi)
+                    if 0 <= ti - mi < 2000:
+                        te = chunk.find('"', ti + 8)
+                        if te > ti + 8:
+                            result["body"] = chunk[ti + 8:te]
+
+            # owner_uid: resolve vanity → numeric user_id
+            if "owner_uid" not in result:
+                if hint.isdigit():
+                    # Numeric hint IS the user_id
+                    result["owner_uid"] = hint
+                else:
+                    # Vanity resolution via '/<vanity>","id":"<uid>"'
+                    vn = 'facebook.com\\/' + hint + '","id":"'
+                    vi = chunk.find(vn)
+                    if vi >= 0:
+                        vs = vi + len(vn)
+                        ve = chunk.find('"', vs)
+                        if ve > vs and chunk[vs:ve].isdigit():
+                            result["owner_uid"] = chunk[vs:ve]
+
+            # owner_name: find "name":"<val>" near resolved uid
+            if "owner_uid" in result and "owner_name" not in result:
+                uid_needle = '"id":"' + result["owner_uid"] + '"'
+                ui = chunk.find(uid_needle)
+                if ui >= 0:
+                    nearby = chunk[max(0, ui - 200):ui + 200]
+                    ni = nearby.find('"name":"')
+                    if ni >= 0:
+                        ns = ni + 8
+                        ne = nearby.find('"', ns)
+                        if ne > ns:
+                            result["owner_name"] = nearby[ns:ne]
+
+            if all(k in result for k in (
+                "mediaset_token", "post_id", "body",
+                "owner_uid", "owner_name",
+            )):
+                break
+
+    def _extract_replies(self, page, owner_pos):
+        """Extract pre-loaded replies from already-fetched HTML.
+
+        Searches for comment body nodes ('"body":{"text":"..."}')
+        within ~500 KB after the owner's post block position.
+        This range covers the own post's pre-rendered comments
+        but excludes sidebar / recommended content that appears
+        much later in the HTML.
+
+        Does NOT make additional HTTP requests.
+        """
+        if owner_pos < 0:
+            return []
+
+        section = page[owner_pos:owner_pos + 524288]
+        replies = []
+        needle = '"body":{"text":"'
+        pos = -1
+
+        while True:
+            pos = section.find(needle, pos + 1)
+            if pos < 0:
+                break
+
+            ts = pos + len(needle)
+            te = section.find('"', ts)
+            if te <= ts:
+                continue
+            body_text = section[ts:te]
+
+            # author — search FORWARD for the "author" block that
+            # FB places AFTER the body in its relay-style HTML
+            fwd = section[te:te + 5000]
+            author = ""
+            author_id = ""
+            author_needle = '"author":{"__typename":"User","id":"'
+            ai = fwd.find(author_needle)
+            if ai >= 0:
+                id_start = ai + len(author_needle)
+                id_end = fwd.find('"', id_start)
+                if id_end > id_start:
+                    author_id = fwd[id_start:id_end]
+                ni = fwd.find('"name":"', id_end)
+                if ni >= 0 and ni - ai < 200:
+                    ns = ni + 8
+                    ne = fwd.find('"', ns)
+                    if ne > ns:
+                        author = fwd[ns:ne]
+
+            replies.append({
+                "author": author,
+                "author_id": author_id,
+                "text": body_text,
+            })
+
+        return replies
+
+    def _extract_url_pfbid(self):
+        """Extract a pfbid token from the request URL, if present."""
+        pos = self.url.find("pfbid")
+        if pos < 0:
+            return ""
+        end = pos + 5
+        url = self.url
+        while end < len(url) and url[end].isalnum():
+            end += 1
+        return url[pos:end]
 
     def parse_set_page(self, set_page):
         directory = {
@@ -51,20 +351,20 @@ class FacebookExtractor(Extractor):
             ) or text.extr(
                 set_page, '"mediasetToken":"', '"'
             ),
-            "username": self.decode_all(
+            "username": (
                 text.extr(
                     set_page, '"user":{"__isProfile":"User","name":"', '","'
                 ) or text.extr(
                     set_page, '"actors":[{"__typename":"User","name":"', '","'
-                )
+                ) or ""
             ),
             "user_id": text.extr(
                 set_page, '"owner":{"__typename":"User","id":"', '"'
             ),
             "user_pfbid": "",
-            "title": self.decode_all(text.extr(
+            "title": text.extr(
                 set_page, '"title":{"text":"', '"'
-            )),
+            ) or "",
             "first_photo_id": text.extr(
                 set_page,
                 '{"__typename":"Photo","__isMedia":"Photo","',
@@ -84,7 +384,40 @@ class FacebookExtractor(Extractor):
                     set_page, '"userID":"', '"') or
                 directory["set_id"].split(".")[1])
 
+        # Build a {photo_id: url} fallback map from the set page.
+        # FB's newer layout embeds full photo URIs in the set page
+        # while the per-photo page only carries dimensions, so this
+        # map is the only source of URLs for those photos.
+        directory["_set_page_urls"] = self._extract_set_photo_urls(set_page)
+
         return directory
+
+    def _extract_set_photo_urls(self, set_page):
+        """Extract a {photo_id: url} map from a set page.
+
+        Two markup variants are handled:
+          1. uri before id: '"image":{...,"uri":"<url>"}...,"id":"<id>"'
+          2. id before uri: '"id":"<id>"...,"image":{...,"uri":"<url>"}'
+
+        Returns an empty dict if no entries found (older set pages
+        where photo URLs only live in per-photo pages).
+        """
+        urls = {}
+        # Variant 1: image (with uri) appears before id
+        for m in re.finditer(
+            r'"__typename":"Photo","__isMedia":"Photo","image":'
+            r'\{[^}]*"uri":"([^"]+)"[^}]*\}[^}]{0,200}?"id":"(\d+)"',
+            set_page,
+        ):
+            urls.setdefault(m.group(2), self._decode_url(m.group(1)))
+        # Variant 2: id appears before image
+        for m in re.finditer(
+            r'"__typename":"Photo","__isMedia":"Photo","id":"(\d+)"'
+            r'[^}]{0,500}?"image":\{[^}]*"uri":"([^"]+)"',
+            set_page,
+        ):
+            urls.setdefault(m.group(1), self._decode_url(m.group(2)))
+        return urls
 
     def parse_photo_page(self, photo_page):
         photo = {
@@ -96,28 +429,37 @@ class FacebookExtractor(Extractor):
                 '"url":"https:\\/\\/www.facebook.com\\/photo\\/?fbid=',
                 '"'
             ).rsplit("&set=", 1)[-1],
-            "username": self.decode_all(text.extr(
+            "username": text.extr(
                 photo_page, '"owner":{"__typename":"User","name":"', '"'
-            )),
+            ) or "",
             "user_id": text.extr(
                 photo_page, '"owner":{"__typename":"User","id":"', '"'
             ),
             "user_pfbid": "",
-            "caption": self.decode_all(text.extr(
+            "caption": text.extr(
                 photo_page,
                 '"message":{"delight_ranges"',
                 '"},"message_preferred_body"'
-            ).rsplit('],"text":"', 1)[-1]),
+            ).rsplit('],"text":"', 1)[-1],
             "date": self.parse_timestamp(
                 text.extr(photo_page, '\\"publish_time\\":', ',') or
                 text.extr(photo_page, '"created_time":', ',')
             ),
-            "url": self.decode_all(text.extr(
+            "url": self._decode_url(text.extr(
                 photo_page, ',"image":{"uri":"', '","'
             )),
+            # Try the legacy 'nextMediaAfterNodeId' field first
+            # (gives correct set-aware navigation for pcb.*/pb.*
+            # albums), fall back to the newer 'nextMedia.edges'
+            # structure used by FB for album types that no longer
+            # populate the legacy field (e.g., a.* user albums).
             "next_photo_id": text.extr(
                 photo_page,
                 '"nextMediaAfterNodeId":{"__typename":"Photo","id":"',
+                '"'
+            ) or text.extr(
+                photo_page,
+                '"nextMedia":{"edges":[{"node":{"__typename":"Photo","id":"',
                 '"'
             )
         }
@@ -166,9 +508,9 @@ class FacebookExtractor(Extractor):
             "id": text.extr(
                 video_page, '\\"video_id\\":\\"', '\\"'
             ),
-            "username": self.decode_all(text.extr(
+            "username": text.extr(
                 video_page, '"actors":[{"__typename":"User","name":"', '","'
-            )),
+            ) or "",
             "user_id": text.extr(
                 video_page, '"owner":{"__typename":"User","id":"', '"'
             ),
@@ -179,11 +521,11 @@ class FacebookExtractor(Extractor):
         }
 
         if not video["username"]:
-            video["username"] = self.decode_all(text.extr(
+            video["username"] = text.extr(
                 video_page,
                 '"__typename":"User","id":"' + video["user_id"] + '","name":"',
                 '","'
-            ))
+            ) or ""
 
         first_video_raw = text.extr(
             video_page, '"permalink_url"', '\\/Period>\\u003C\\/MPD>'
@@ -191,7 +533,7 @@ class FacebookExtractor(Extractor):
 
         audio = {
             **video,
-            "url": self.decode_all(text.extr(
+            "url": self._decode_url(text.extr(
                 text.extr(
                     first_video_raw,
                     "AudioChannelConfiguration",
@@ -208,7 +550,7 @@ class FacebookExtractor(Extractor):
             first_video_raw, 'FBQualityLabel=\\"', '\\u003C\\/BaseURL>'
         ):
             resolution = raw_url.split('\\"', 1)[0]
-            video["urls"][resolution] = self.decode_all(
+            video["urls"][resolution] = self._decode_url(
                 raw_url.split('BaseURL>', 1)[1]
             )
 
@@ -250,7 +592,26 @@ class FacebookExtractor(Extractor):
 
     def extract_set(self, set_data):
         set_id = set_data["set_id"]
-        all_photo_ids = [set_data["first_photo_id"]]
+        # Fallback URL map built by parse_set_page from the set
+        # page's bulk-loaded photo URIs (FB's newer layout omits
+        # the URI from per-photo pages).
+        set_page_urls = set_data.get("_set_page_urls") or {}
+
+        # When the set page already provided a complete photo
+        # list, use it as the canonical iteration source. The
+        # newer per-photo page layout often omits 'next_photo_id'
+        # entirely, so chain-walking would stop at the first
+        # photo. The existing loop / jump / next_photo_id logic
+        # below remains a no-op when all ids are pre-populated.
+        if set_page_urls:
+            all_photo_ids = list(set_page_urls)
+            first_pid = set_data.get("first_photo_id")
+            if first_pid and first_pid in set_page_urls and \
+                    all_photo_ids[0] != first_pid:
+                all_photo_ids.remove(first_pid)
+                all_photo_ids.insert(0, first_pid)
+        else:
+            all_photo_ids = [set_data["first_photo_id"]]
 
         retries = 0
         i = 0
@@ -263,6 +624,17 @@ class FacebookExtractor(Extractor):
             photo = self.parse_photo_page(photo_page)
             photo["num"] = i + 1
 
+            # If the photo page didn't carry the image URI, fall
+            # back to the set page's pre-extracted map.
+            if not photo["url"] and photo_id in set_page_urls:
+                photo["url"] = set_page_urls[photo_id]
+                if not photo["id"]:
+                    photo["id"] = photo_id
+                # parse_photo_page already ran nameext_from_url on
+                # an empty url, so re-run it now to populate
+                # filename / extension from the actual url.
+                text.nameext_from_url(photo["url"], photo)
+
             if self.author_followups:
                 for followup_id in photo["followups_ids"]:
                     if followup_id not in all_photo_ids:
@@ -273,7 +645,7 @@ class FacebookExtractor(Extractor):
 
             if not photo["url"]:
                 if retries < self.fallback_retries and self._interval_429:
-                    seconds = self._interval_429()
+                    seconds = self._interval_429(retries)
                     self.log.warning(
                         "Failed to find photo download URL for %s. "
                         "Retrying in %s seconds.", photo_url, seconds,
@@ -290,6 +662,7 @@ class FacebookExtractor(Extractor):
             else:
                 retries = 0
                 photo.update(set_data)
+                self._decode_metadata(photo)
                 yield Message.Directory, "", photo
                 yield Message.Url, photo["url"], photo
 
@@ -304,7 +677,7 @@ class FacebookExtractor(Extractor):
                         "Detected a loop in the set, it's likely finished. "
                         "Extraction is over."
                     )
-            elif self._detect_jump and not set_id.startswith('pcb.') and \
+            elif self._detect_jump and \
                     int(photo["next_photo_id"]) > int(photo["id"]) + i*120:
                 self.log.info(
                     "Detected jump to the beginning of the set. (%s -> %s)",
@@ -375,11 +748,11 @@ class FacebookExtractor(Extractor):
             ]
 
             if bio := text.extr(page, '"best_description":{"text":"', '"'):
-                user["biography"] = self.decode_all(bio)
+                user["biography"] = bio
             elif (pos := page.find(
                     '"__module_operation_ProfileCometTileView_profileT')) >= 0:
-                user["biography"] = self.decode_all(text.rextr(
-                    page, '"text":"', '"', pos))
+                user["biography"] = text.rextr(
+                    page, '"text":"', '"', pos) or ""
             else:
                 user["biography"] = text.unescape(text.remove_html(text.extr(
                     page, "</span></span></h2>", "<ul>")))
@@ -388,6 +761,221 @@ class FacebookExtractor(Extractor):
                 self.log.debug("Failed to extract user data: %s", data)
                 user = {}
         return user
+
+
+class FacebookPostExtractor(FacebookExtractor):
+    """Extractor for Facebook Post pages"""
+    subcategory = "post"
+    directory_fmt = ("{category}", "{username} ({user_id})", "{post_id}")
+    filename_fmt = "{id}.{extension}"
+    archive_fmt = "{post_id}_{id}.{extension}"
+    pattern = BASE_PATTERN + r"/[^/?#]+/posts/([^/?#]+)"
+    example = "https://www.facebook.com/USERNAME/posts/POST_ID"
+
+    def items(self):
+        token = self.groups[0]
+        post_page = self.request(self.url).text
+
+        # Owner-anchored extraction (primary)
+        owner_hint = self._extract_owner_hint(self.url)
+        ctx = self._find_owner_context(post_page, owner_hint) \
+            if owner_hint else {}
+
+        # Creation story decode (supplementary / fallback)
+        cs_uid, cs_pid = self._extract_post_identity(post_page)
+
+        # Merge: owner context preferred, creation_story as fallback
+        owner_id = ctx.get("owner_uid") or cs_uid or \
+            (owner_hint if owner_hint.isdigit() else "")
+        post_id = ctx.get("post_id") or cs_pid
+        username = ctx.get("owner_name") or \
+            self._extract_owner_username(post_page, owner_id)
+        body = ctx.get("body", "")
+        own_token = ctx.get("mediaset_token")
+        post_pfbid = self._extract_url_pfbid()
+
+        # Fallback: if URL token is a pure numeric post_id
+        if not post_id and token.isdigit():
+            post_id = token
+        # Derive post_id from mediaset_token (pcb.<post_id>)
+        if not post_id and own_token and own_token.startswith("pcb."):
+            post_id = own_token[4:]
+
+        if not post_id:
+            self.log.warning(
+                "Could not extract post identity from '%s'", self.url)
+            return
+
+        # Extract replies from already-fetched HTML
+        replies = self._extract_replies(
+            post_page, ctx.get("_owner_pos", -1))
+
+        # Directory metadata
+        directory = {
+            "post_id"    : post_id,
+            "user_id"    : owner_id,
+            "username"   : username,
+            "body"       : body,
+            "post_pfbid" : post_pfbid,
+        }
+
+        # For single-photo posts, pre-fetch the photo and its parent
+        # album so that set_id / title are available in directory
+        # metadata BEFORE the first yield (keeps JSON + photo in
+        # the same directory when users customise directory_fmt).
+        photo_data = None
+        if not own_token:
+            photo_data = self._resolve_single_photo(post_page)
+            if photo_data:
+                directory["set_id"] = photo_data.get("set_id", "")
+                directory["title"] = photo_data.get("title", "")
+
+        # Keep raw (undecoded) copy for _post_photos_multi —
+        # extract_set will decode once via _decode_metadata.
+        # Decoding directory here is for the Directory yield +
+        # JSON content; passing the decoded values into
+        # extract_set would cause a double-decode (mojibake).
+        raw_directory = dict(directory)
+
+        self._decode_metadata(directory)
+
+        # Decode replies for JSON output
+        for reply in replies:
+            for rkey in ("text", "author"):
+                val = reply.get(rkey)
+                if isinstance(val, str) and val:
+                    reply[rkey] = self._safe_decode(val)
+
+        yield Message.Directory, "", directory
+
+        # Dump post content as JSON file
+        content = json.dumps({
+            "post_id"    : post_id,
+            "user_id"    : owner_id,
+            "username"   : directory["username"],
+            "post_pfbid" : post_pfbid,
+            "body"       : directory["body"],
+            "replies"    : replies,
+        }, ensure_ascii=False, indent=2)
+        yield Message.Url, "text:" + content, {
+            **directory,
+            "filename" : post_id,
+            "extension": "json",
+            "id"       : post_id,
+        }
+
+        # Yield photo(s) — pass raw_directory so extract_set
+        # decodes only once (not the already-decoded directory)
+        if own_token:
+            yield from self._post_photos_multi(
+                post_page, raw_directory, own_token)
+        elif photo_data:
+            photo_data.update(directory)
+            yield Message.Url, photo_data["url"], photo_data
+
+    def _post_photos_multi(self, post_page, directory, set_token):
+        """Walk a multi-photo post's set with clean post metadata."""
+        set_url = f"{self.root}/media/set/?set={set_token}"
+        set_page = self.request(set_url).text
+        set_data = self.parse_set_page(set_page)
+
+        # Override owner identity with clean values from post page
+        set_data["user_id"] = directory["user_id"]
+        set_data["username"] = directory["username"]
+        set_data["post_id"] = directory["post_id"]
+        set_data["post_pfbid"] = directory.get("post_pfbid", "")
+        set_data["body"] = directory.get("body", "")
+
+        self._detect_jump = False
+        yield from self.extract_set(set_data)
+
+    def _resolve_single_photo(self, post_page):
+        """Fetch the single photo and its parent album metadata.
+
+        Returns a photo dict with set_id, title, url, id, etc.
+        populated, or None if extraction fails.  Does NOT yield —
+        the caller handles Directory/Url emission so that JSON
+        content and the photo share the same directory context.
+        """
+        media_block = text.extr(
+            post_page, '"__isMedia":"Photo"', '"target_group"')
+        first_photo_url = (
+            text.extr(media_block, '"url":"', ',')
+            if media_block else "")
+        if not first_photo_url:
+            return None
+
+        params = text.parse_query(first_photo_url.partition("?")[2])
+        photo_fbid = params.get("fbid")
+        if not photo_fbid:
+            return None
+
+        photo_url = f"{self.root}/photo/?fbid={photo_fbid}&set="
+        photo_page = self.photo_page_request_wrapper(photo_url).text
+        photo = self.parse_photo_page(photo_page)
+        photo["num"] = 1
+        photo["id"] = photo.get("id") or photo_fbid
+
+        # Populate album metadata (set_id + title) from the photo's
+        # parent set — same as PhotoExtractor does.  This makes
+        # {title} and {set_id} available for users who customise
+        # directory_fmt to use SetExtractor-style paths.
+        if photo.get("set_id"):
+            set_url = f"{self.root}/media/set/?set={photo['set_id']}"
+            set_page = self.request(set_url).text
+            album = self.parse_set_page(set_page)
+            photo["title"] = album.get("title", "")
+
+        return photo
+
+
+class FacebookPermalinkExtractor(FacebookExtractor):
+    """Resolver for Facebook permalink and event post URLs.
+
+    Fetches the URL, identifies the content type from the server
+    response, and dispatches to the appropriate extractor
+    (PostExtractor for posts, SetExtractor as fallback).
+    """
+    subcategory = "permalink"
+    pattern = (
+        BASE_PATTERN +
+        r"/(?:(?:groups/)?(?:[^/?#]+/)?permalink(?:\.php)?"
+        r"(?:/(\d+)|\?\w+=([^/?#]+))"
+        r"|events/[^/?#]+/\??post_id=(\d+))"
+    )
+    example = ("https://www.facebook.com/"
+               "permalink.php?story_fbid=STORY_ID&id=USER_ID")
+
+    def items(self):
+        page = self.request(self.url).text
+
+        # Try to resolve to a post via owner-anchored extraction
+        owner_hint = self._extract_owner_hint(self.url)
+        ctx = self._find_owner_context(page, owner_hint) \
+            if owner_hint else {}
+        cs_uid, cs_pid = self._extract_post_identity(page)
+
+        owner_id = ctx.get("owner_uid") or cs_uid or \
+            (owner_hint if owner_hint.isdigit() else "")
+        post_id = ctx.get("post_id") or cs_pid
+
+        if post_id and post_id.isdigit() and owner_id and owner_id.isdigit():
+            # Resolved as a post → dispatch to PostExtractor
+            canonical = f"{self.root}/{owner_id}/posts/{post_id}"
+            yield Message.Queue, canonical, {
+                "_extractor": FacebookPostExtractor,
+            }
+            return
+
+        # Fallback: construct a set URL from the captured token
+        pcb1, pcb2, pcb3 = self.groups
+        raw = pcb1 or pcb2 or pcb3
+        if raw:
+            token = raw.partition("&")[0]  # strip &id=... suffix
+            set_url = f"{self.root}/media/set/?set=pcb.{token}"
+            yield Message.Queue, set_url, {
+                "_extractor": FacebookSetExtractor,
+            }
 
 
 class FacebookPhotoExtractor(FacebookExtractor):
@@ -418,6 +1006,8 @@ class FacebookPhotoExtractor(FacebookExtractor):
             elif not photo.get(key):
                 photo[key] = directory.get(key)
 
+        self._decode_metadata(directory)
+        self._decode_metadata(photo)
         yield Message.Directory, "", directory
         yield Message.Url, photo["url"], photo
 
@@ -434,44 +1024,39 @@ class FacebookPhotoExtractor(FacebookExtractor):
 
 
 class FacebookSetExtractor(FacebookExtractor):
-    """Base class for Facebook Set extractors"""
+    """Extractor for direct Facebook media set URLs (albums, profile sets)"""
     subcategory = "set"
     pattern = (
         BASE_PATTERN +
         r"/(?:(?:media/set|photo)/?\?(?:[^&#]+&)*set=([^&#]+)"
         r"[^/?#]*(?<!&setextract)$"
-        r"|[^/?#]+/posts/([^/?#]+)"
-        r"|photo/\?(?:[^&#]+&)*fbid=([^/?&#]+)&set=([^/?&#]+)&setextract"
-        r"|(?:groups/)?(?:[^/?#]+/)?(?:permalink|posts)(?:\.php)?"
-        r"(?:/(\d+)|\?\w+=([^/?#]+))"
-        r"|events/[^/?#]+/\??post_id=(\d+))"
+        r"|photo/\?(?:[^&#]+&)*fbid=([^/?&#]+)&set=([^/?&#]+)&setextract)"
     )
     example = "https://www.facebook.com/media/set/?set=SET_ID"
 
     def items(self):
-        set_id, path, first_pid, set_id2, pcb1, pcb2, pcb3 = self.groups
+        set_id, first_pid, set_id2 = self.groups
         if not set_id:
             set_id = set_id2
 
-        if path:
-            post_url = f"{self.root}/{path}"
-            post_page = self.request(post_url).text
-            post = self.parse_post_page(post_page)
-
-            set_id = post["set_id"]
-            if not set_id:
-                params = text.parse_query(post["post_photo"].partition("?")[2])
-                self.groups = (params["fbid"],)
-                return FacebookPhotoExtractor.items(self)
+        # Disable the jump-detection heuristic for post-bound
+        # (pcb.*) and user-album (a.*) sets — their photo ids
+        # can have large numeric gaps (FB snowflake IDs from
+        # different upload batches) that trigger false
+        # positives in 'next > id + i*120'. pb.* profile photo
+        # sets keep the heuristic since they're what it was
+        # designed to detect loops for.
+        if set_id.startswith(("pcb.", "a.")):
             self._detect_jump = False
-        elif not set_id:
-            set_id = "pcb." + (pcb1 or pcb2 or pcb3)
 
         set_url = f"{self.root}/media/set/?set={set_id}"
         set_page = self.request(set_url).text
         set_data = self.parse_set_page(set_page)
         if first_pid:
             set_data["first_photo_id"] = first_pid
+
+        if set_id.startswith("pcb.") and set_id[4:].isdigit():
+            set_data["post_id"] = set_id[4:]
 
         return self.extract_set(set_data)
 
@@ -480,7 +1065,7 @@ class FacebookVideoExtractor(FacebookExtractor):
     """Base class for Facebook Video extractors"""
     subcategory = "video"
     directory_fmt = ("{category}", "{username}", "{subcategory}")
-    pattern = BASE_PATTERN + r"/(?:[^/?#]+/videos/|watch/?\?v=)([^/?&#]+)"
+    pattern = BASE_PATTERN + r"/(?:[^/?#]+/videos/|watch/?\?v=|reel/)([^/?&#]+)"
     example = "https://www.facebook.com/watch/?v=VIDEO_ID"
 
     def items(self):
@@ -493,6 +1078,8 @@ class FacebookVideoExtractor(FacebookExtractor):
         if "url" not in video:
             return
 
+        self._decode_metadata(video)
+        self._decode_metadata(audio)
         yield Message.Directory, "", video
 
         if self.videos == "ytdl":
@@ -512,6 +1099,7 @@ class FacebookInfoExtractor(FacebookExtractor):
 
     def items(self):
         user = self.cache(self._extract_profile, self.groups[0])
+        self._decode_metadata(user)
         return iter(((Message.Directory, "", user),))
 
 
@@ -611,6 +1199,7 @@ class FacebookAvatarExtractor(FacebookExtractor):
                 "type" : "avatar",
             })
 
+        self._decode_metadata(directory)
         yield Message.Directory, "", directory
         yield Message.Url, avatar["url"], avatar
 

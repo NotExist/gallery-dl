@@ -154,11 +154,10 @@ __tests__ = (
 
 {
     "#url"     : "https://www.facebook.com/joho.press.jp/posts/pfbid02mfFRpVkErLQxQ8cpD2f1hwXEVsFzK8kfNBKdK2Jndnx6AkmMQZuXhovwDgwvoDNil",
-    "#class"   : facebook.FacebookSetExtractor,
+    "#class"   : facebook.FacebookPostExtractor,
     "#range"   : "1-3",
     "#count"   : 3,
 
-    "set_id"   : "pcb.1160563418981189",
     "user_id"  : "100050826247807",
     "username" : "情報プレスα",
 },
@@ -187,23 +186,30 @@ __tests__ = (
 
 {
     "#url"     : "https://www.facebook.com/permalink.php?story_fbid=pfbid02P6zhg3UN71iAM1kiprstNfZuArXc83n5n1X842kPbsyQU6BdAUacgNsHw3LkmKasl&id=61558212601742",
-    "#comment" : "'/permalink.php' post URL (#9352)",
-    "#class"   : facebook.FacebookSetExtractor,
-    "#range"   : "1-3",
-    "#pattern" : r"https://scontent-.*.xx.fbcdn.net/v/.+",
+    "#comment" : "'/permalink.php' post URL (#9352) → PermalinkExtractor → PostExtractor",
+    "#class"   : facebook.FacebookPermalinkExtractor,
+},
 
-    "caption"       : "",
-    "date"          : "dt:2026-03-20 07:01:13",
-    "extension"     : "jpg",
-    "filename"      : str,
-    "first_photo_id": "122225439782273753",
-    "followups_ids" : [],
-    "id"            : r"re:12\d+",
-    "set_id"        : "pcb.pfbid02P6zhg3UN71iAM1kiprstNfZuArXc83n5n1X842kPbsyQU6BdAUacgNsHw3LkmKasl",
-    "title"         : "Photos from 金城漫與畫's post",
-    "user_id"       : "61558212601742",
-    "user_pfbid"    : "",
-    "username"      : "金城漫與畫",
+{
+    "#url"     : "https://www.facebook.com/PixyNSFW/posts/pfbid02qiQ6TYUGVr8N5DNBmgZTC6iCfD8NCDkT49k269s3qsyrK7eaz3VdK2M59SRsHcTUl",
+    "#comment" : "single-photo post via PostExtractor; HTML embeds "
+                 "unrelated 'pcb.*' sets in the sidebar",
+    "#class"   : facebook.FacebookPostExtractor,
+    "#auth"    : True,
+    "#count"   : 2,
+
+    "post_id"       : "1520962169501671",
+    "user_id"       : "100047637073622",
+    "username"      : "Pixy",
+    "body"          : "@chihel2731",
+    "post_pfbid"    : "pfbid02qiQ6TYUGVr8N5DNBmgZTC6iCfD8NCDkT49k269s3qsyrK7eaz3VdK2M59SRsHcTUl",
+},
+
+{
+    "#url"     : "https://www.facebook.com/permalink.php?story_fbid=pfbid02cyK3VknfeCjtHP8BKDZkXxJzXMYpAMzpvGvHa3H8ePKirvt5ubyfzFDCzichmv92l&id=61560335556218",
+    "#comment" : "permalink.php → PermalinkExtractor → PostExtractor",
+    "#class"   : facebook.FacebookPermalinkExtractor,
+    "#auth"    : True,
 },
 
 {
