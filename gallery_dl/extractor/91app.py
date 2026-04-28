@@ -71,7 +71,7 @@ import json
 import datetime
 
 from .common import BaseExtractor, Message
-from .. import text
+from .. import text, config
 
 
 _VIEWMODEL_RE = re.compile(
@@ -101,8 +101,24 @@ class _91appExtractor(BaseExtractor):
     archive_fmt = "{salepage_id}_{filename}.{extension}"
 
     def _init(self):
-        self._write_metadata = self.config("metadata", True)
-        self._yield_externals = self.config("externals", True)
+        self._write_metadata = self._bc_config("metadata", True)
+        self._yield_externals = self._bc_config("externals", True)
+        self._follow_group = self._bc_config("follow-group", False)
+
+    def _bc_config(self, key, default):
+        """Read a setting, falling back to ``extractor.<basecategory>.<key>``.
+
+        BaseExtractor's per-instance cfgpath is
+        ``("extractor", <category>, <subcategory>)``, so plain
+        ``self.config(key)`` never visits ``extractor.<basecategory>``.
+        91app users naturally want to set ``extractor.91app.<setting>`` to
+        cover all instances — this helper bridges that gap.
+        """
+        val = self.config(key)
+        if val is None:
+            val = config.interpolate(
+                ("extractor", self.basecategory), key, default)
+        return val
 
 
 # No instances pre-registered: see module docstring for usage.
@@ -121,14 +137,27 @@ class _91appProductExtractor(_91appExtractor):
         page = self.request(url, notfound="product").text
 
         vm = self._parse_viewmodel(page)
-        meta = self._normalize(vm)
+        addl = self._fetch_additional_info(vm.get("ShopId"), vm.get("Id"))
+
+        body_html = ""
+        if isinstance(addl, dict):
+            mi = addl.get("moreInfo") or {}
+            if isinstance(mi, dict):
+                body_html = mi.get("saleProductDesc_Content") or ""
+
+        meta = self._normalize(vm, addl=addl)
         primary = self._collect_primary(vm)
-        externals = self._collect_externals(vm)
+        externals = self._collect_externals(vm, body_html=body_html)
 
         snapshot = dict(meta)
         snapshot["images"] = [u for u, _ in primary]
         snapshot["external_media"] = [
             {"url": u, "kind": k} for u, k in externals]
+        # Full raw API responses kept for forensic completeness — both
+        # ViewModel (~50KB) and additional-info (~3KB) live alongside the
+        # curated convenience fields, never replacing them.
+        snapshot["raw_viewmodel"] = vm
+        snapshot["raw_additional_info"] = addl
 
         yield Message.Directory, "", meta
 
@@ -151,9 +180,69 @@ class _91appProductExtractor(_91appExtractor):
             kw["extension"] = self._ext(img_url)
             yield Message.Url, img_url, kw
 
+        # External media split:
+        # * image-kind URLs (kind starts with "img:") download in-place to
+        #   the product directory so merchant-CDN body images land alongside
+        #   the img.91app.com images.
+        # * iframe / main_video URLs go through Message.Queue so a sibling
+        #   extractor (yt-dlp via ytdl: prefix, etc.) can take them.
         if self._yield_externals:
+            extra_num = len(primary)
             for url_, kind in externals:
-                yield Message.Queue, url_, {"product": meta, "kind": kind}
+                if kind.startswith("img:"):
+                    extra_num += 1
+                    info = dict(meta)
+                    info["num"] = extra_num
+                    info["filename"] = self._body_filename(url_, kind, extra_num)
+                    info["extension"] = self._ext(url_)
+                    info["kind"] = kind
+                    yield Message.Url, url_, info
+                else:
+                    yield Message.Queue, url_, {
+                        "product": meta, "kind": kind}
+
+        # follow-group: queue the SalePageGroup siblings (other color /
+        # style variants of the same product). Default off; user enables
+        # via extractor.91app.follow-group=true.
+        if self._follow_group:
+            sg = meta.get("salepage_group") or {}
+            my_id = meta.get("salepage_id")
+            for it in (sg.get("items") or ()):
+                sid = it.get("salepage_id")
+                if not sid or sid == my_id:
+                    continue
+                target = f"{self.root}/SalePage/Index/{sid}"
+                yield Message.Queue, target, {
+                    "product": meta,
+                    "kind"   : f"group:{it.get('title') or ''}",
+                }
+
+    # ------------------------------------------------------------------ #
+    # additional-info API
+    # ------------------------------------------------------------------ #
+    def _fetch_additional_info(self, shop_id, sp_id):
+        """Fetch /salepage-listing/api/salepage/additional-info/<shop>/<sp>.
+
+        Returns the response ``data`` object (dict) on success, ``None`` on
+        any failure (network, non-Success code, parse).  Caller treats
+        ``None`` as "no extra data" — the SalePage extractor still works,
+        just without specs / body images.
+        """
+        if not shop_id or not sp_id:
+            return None
+        url = (f"{self.root}/salepage-listing/api/salepage/"
+               f"additional-info/{shop_id}/{sp_id}")
+        response = self.request(url, fatal=False)
+        if response.status_code != 200:
+            return None
+        try:
+            envelope = response.json()
+        except Exception:
+            return None
+        if envelope.get("code") != "Success":
+            return None
+        data = envelope.get("data")
+        return data if isinstance(data, dict) else None
 
     # ------------------------------------------------------------------ #
     # ViewModel parsing
@@ -191,12 +280,18 @@ class _91appProductExtractor(_91appExtractor):
             urls.append((src, f"{int(seq)+1:02d}"))
         return urls
 
-    def _collect_externals(self, vm):
+    def _collect_externals(self, vm, body_html=""):
         """Pull (url, kind) tuples from MainImageVideo + description bodies.
 
         ``kind`` is one of ``main_video`` / ``img:<field>`` / ``iframe:<field>``
         — primarily for the JSON sidecar; gallery-dl's dispatcher only sees
         the URL and decides routing by URL pattern.
+
+        ``body_html`` is the rich body markup from
+        ``additional-info.data.moreInfo.saleProductDesc_Content``; its
+        embedded ``<img>`` (typically merchant CDN like
+        ``photo.<shop>.com.tw``) and ``<iframe>`` are added under the
+        ``img:body`` / ``iframe:body`` kinds.
         """
         out = []
         seen = set()
@@ -225,6 +320,21 @@ class _91appProductExtractor(_91appExtractor):
                         continue
                     seen.add(src)
                     out.append((src, f"iframe:{fld}"))
+
+        if body_html:
+            for tag in text.extract_iter(body_html, "<img", ">"):
+                if src := self._extract_src(tag):
+                    if "img.91app.com" in src or src in seen:
+                        continue
+                    seen.add(src)
+                    out.append((src, "img:body"))
+            for tag in text.extract_iter(body_html, "<iframe", ">"):
+                if src := self._extract_src(tag):
+                    if src in seen:
+                        continue
+                    seen.add(src)
+                    out.append((src, "iframe:body"))
+
         return out
 
     @staticmethod
@@ -250,12 +360,61 @@ class _91appProductExtractor(_91appExtractor):
         # img.91app.com URLs have no extension; default to jpg
         return "jpg"
 
+    @staticmethod
+    def _body_filename(url, kind, num):
+        """Derive a filename for a body / description image.
+
+        Prefer the source URL's basename (sans extension) so merchant-CDN
+        files keep recognisable names (e.g. ``B52202-01``).  Fall back to a
+        ``body_NN`` / ``desc_NN`` numeric tag based on the kind suffix when
+        the URL has no usable basename.
+        """
+        path = url.partition("?")[0].rstrip("/")
+        base = path.rpartition("/")[2]
+        stem = base.rsplit(".", 1)[0]
+        if stem and stem != base:
+            return stem
+        if base:
+            return base
+        prefix = kind.partition(":")[2] or "body"
+        return f"{prefix}_{num:02d}"
+
     # ------------------------------------------------------------------ #
     # Metadata normalization
     # ------------------------------------------------------------------ #
-    def _normalize(self, vm):
+    def _normalize(self, vm, addl=None):
         miv = vm.get("MainImageVideo") or {}
         miv = miv if isinstance(miv, dict) and miv else None
+
+        # SalePageGroup — sibling SalePageIds for color / style variants
+        sg = vm.get("SalePageGroup") or {}
+        salepage_group = None
+        if isinstance(sg, dict) and sg.get("SalePageItems"):
+            items = []
+            for it in sg.get("SalePageItems") or ():
+                if not isinstance(it, dict):
+                    continue
+                thumb = it.get("ItemUrl") or ""
+                if thumb.startswith("//"):
+                    thumb = "https:" + thumb
+                items.append({
+                    "salepage_id": it.get("SalePageId"),
+                    "title"      : it.get("GroupItemTitle") or "",
+                    "sort"       : it.get("ItemSort"),
+                    "thumb_url"  : thumb,
+                    "image_group": it.get("ImageGroup") or "",
+                })
+            salepage_group = {
+                "group_code" : sg.get("GroupCode") or "",
+                "group_title": sg.get("GroupTitle") or "",
+                "icon_style" : sg.get("GroupIconStyle") or "",
+                "items"      : items,
+            }
+
+        # additional-info supplementary fields
+        ai = addl if isinstance(addl, dict) else {}
+        more_info = ai.get("moreInfo") if isinstance(
+            ai.get("moreInfo"), dict) else {}
 
         return {
             "category"            : self.category,
@@ -315,6 +474,13 @@ class _91appProductExtractor(_91appExtractor):
             "update_time"         : vm.get("UpdatedDateTime") or "",
             # SEO
             "seo_tag"             : vm.get("SEOTag") or {},
+            # Style / color variants (from ViewModel.SalePageGroup)
+            "salepage_group"      : salepage_group,
+            # Supplementary data from /salepage-listing/api/.../additional-info
+            "specifications"      : ai.get("notKeyPropertyList") or [],
+            "additional_promotions": ai.get("promotionInfoList") or [],
+            "loyalty_point_excluded": bool(ai.get("isLoyaltyPointExcluded")),
+            "more_info"           : more_info,
             # Fetch timestamp
             "fetched_at"          : datetime.datetime.now(
                 datetime.timezone.utc).isoformat(),
