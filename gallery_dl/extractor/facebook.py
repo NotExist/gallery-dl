@@ -766,7 +766,7 @@ class FacebookExtractor(Extractor):
 class FacebookPostExtractor(FacebookExtractor):
     """Extractor for Facebook Post pages"""
     subcategory = "post"
-    directory_fmt = ("{category}", "{username} ({user_id})", "{post_id}")
+    directory_fmt = ("{category}", "{username}", "{post_id}")
     filename_fmt = "{id}.{extension}"
     archive_fmt = "{post_id}_{id}.{extension}"
     pattern = BASE_PATTERN + r"/[^/?#]+/posts/([^/?#]+)"
