@@ -126,6 +126,12 @@ BASE_PATTERN = _91appExtractor.update({})
 class _91appProductExtractor(_91appExtractor):
     """Extractor for a single 91app SalePage (product)"""
     subcategory = "product"
+    # ``{subdir:?//}`` renders to nothing for primary images and to
+    # ``body`` for description / body images, isolating them from
+    # primary numbering collisions (peachjohn's body imgs are stem-named
+    # ``0..N.jpg``, which would clash with primary's ``01..NN.jpg`` at
+    # any 2-digit overlap).
+    directory_fmt = ("{category}", "{salepage_id} {title}", "{subdir:?//}")
     pattern = BASE_PATTERN + r"/SalePage/Index/(\d+)"
     example = "91app:https://example.com/SalePage/Index/123"
 
@@ -159,7 +165,7 @@ class _91appProductExtractor(_91appExtractor):
         snapshot["raw_viewmodel"] = vm
         snapshot["raw_additional_info"] = addl
 
-        yield Message.Directory, "", meta
+        yield Message.Directory, "", {**meta, "subdir": ""}
 
         if self._write_metadata:
             ts = datetime.datetime.now(datetime.timezone.utc).strftime(
@@ -181,25 +187,33 @@ class _91appProductExtractor(_91appExtractor):
             yield Message.Url, img_url, kw
 
         # External media split:
-        # * image-kind URLs (kind starts with "img:") download in-place to
-        #   the product directory so merchant-CDN body images land alongside
-        #   the img.91app.com images.
-        # * iframe / main_video URLs go through Message.Queue so a sibling
-        #   extractor (yt-dlp via ytdl: prefix, etc.) can take them.
+        # * image-kind URLs (kind starts with "img:") download into a
+        #   ``body/`` subdirectory so they cannot collide with primary
+        #   ``NN.jpg`` numbering — peachjohn's SalePageDesc body imgs
+        #   are stem-named ``10.jpg``..``13.jpg`` and would otherwise
+        #   skip-overwrite the primary ImageList entries.
+        # * iframe / main_video URLs go through Message.Queue so a
+        #   sibling extractor (yt-dlp via ytdl: prefix, etc.) can take
+        #   them; queue items don't follow the local directory state.
         if self._yield_externals:
-            extra_num = len(primary)
-            for url_, kind in externals:
-                if kind.startswith("img:"):
-                    extra_num += 1
+            img_externals = [(u, k) for u, k in externals
+                             if k.startswith("img:")]
+            queue_externals = [(u, k) for u, k in externals
+                               if not k.startswith("img:")]
+
+            if img_externals:
+                yield Message.Directory, "", {**meta, "subdir": "body"}
+                for num, (url_, kind) in enumerate(img_externals, 1):
                     info = dict(meta)
-                    info["num"] = extra_num
-                    info["filename"] = self._body_filename(url_, kind, extra_num)
+                    info["num"] = num
+                    info["filename"] = self._body_filename(url_, kind, num)
                     info["extension"] = self._ext(url_)
                     info["kind"] = kind
                     yield Message.Url, url_, info
-                else:
-                    yield Message.Queue, url_, {
-                        "product": meta, "kind": kind}
+
+            for url_, kind in queue_externals:
+                yield Message.Queue, url_, {
+                    "product": meta, "kind": kind}
 
         # follow-group: queue the SalePageGroup siblings (other color /
         # style variants of the same product). Default off; user enables
