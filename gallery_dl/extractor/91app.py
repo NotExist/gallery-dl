@@ -145,7 +145,9 @@ class _91appProductExtractor(_91appExtractor):
 
         meta = self._normalize(vm, addl=addl)
         primary = self._collect_primary(vm)
-        externals = self._collect_externals(vm, body_html=body_html)
+        externals = self._collect_externals(
+            vm, body_html=body_html,
+            primary_urls=(u for u, _ in primary))
 
         snapshot = dict(meta)
         snapshot["images"] = [u for u, _ in primary]
@@ -278,7 +280,7 @@ class _91appProductExtractor(_91appExtractor):
             urls.append((src, f"{int(seq)+1:02d}"))
         return urls
 
-    def _collect_externals(self, vm, body_html=""):
+    def _collect_externals(self, vm, body_html="", primary_urls=()):
         """Pull (url, kind) tuples from MainImageVideo + description bodies.
 
         ``kind`` is one of ``main_video`` / ``img:<field>`` / ``iframe:<field>``
@@ -290,9 +292,15 @@ class _91appProductExtractor(_91appExtractor):
         embedded ``<img>`` (typically merchant CDN like
         ``photo.<shop>.com.tw``) and ``<iframe>`` are added under the
         ``img:body`` / ``iframe:body`` kinds.
+
+        ``primary_urls`` pre-populates the dedup set so any body img
+        whose URL string-matches a primary ImageList URL is skipped.
+        Body images on the same CDN host but a different endpoint
+        (e.g. ``img.91app.com/webapi/images/r/SalePageDesc/...``) are
+        kept — string equality is the only signal we trust.
         """
         out = []
-        seen = set()
+        seen = set(primary_urls)
 
         miv = vm.get("MainImageVideo") or {}
         if isinstance(miv, dict):
@@ -308,7 +316,7 @@ class _91appProductExtractor(_91appExtractor):
                 continue
             for tag in text.extract_iter(html, "<img", ">"):
                 if src := self._extract_src(tag):
-                    if self._is_primary_cdn_url(src) or src in seen:
+                    if src in seen:
                         continue
                     seen.add(src)
                     out.append((src, f"img:{fld}"))
@@ -322,7 +330,7 @@ class _91appProductExtractor(_91appExtractor):
         if body_html:
             for tag in text.extract_iter(body_html, "<img", ">"):
                 if src := self._extract_src(tag):
-                    if self._is_primary_cdn_url(src) or src in seen:
+                    if src in seen:
                         continue
                     seen.add(src)
                     out.append((src, "img:body"))
@@ -334,18 +342,6 @@ class _91appProductExtractor(_91appExtractor):
                     out.append((src, "iframe:body"))
 
         return out
-
-    @staticmethod
-    def _is_primary_cdn_url(url):
-        """True if URL is one of the SalePage primary ImageList paths.
-
-        Used to avoid double-counting ImageList images that also appear
-        in body markup.  ``img.91app.com`` also serves SalePageDesc
-        rich-body images (``/webapi/images/r/SalePageDesc/...``) which
-        are *not* ImageList duplicates and must be kept; the path
-        prefix ``/imagesV3/Original/SalePage/`` is unique to ImageList.
-        """
-        return "/imagesV3/Original/SalePage/" in url
 
     @staticmethod
     def _extract_src(tag):
