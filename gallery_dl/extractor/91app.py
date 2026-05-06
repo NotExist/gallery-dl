@@ -252,8 +252,18 @@ class _91appProductExtractor(_91appExtractor):
         if not m:
             raise self.exc.AbortExtraction(
                 "SalePageIndexViewModel not found in page")
+        raw = m.group(1)
         try:
-            return json.loads(m.group(1))
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # Some shops emit JS-only escapes inside string fields
+            # (mydoll's English policy text has ``don\'t`` / ``store\'s``).
+            # ``\'`` is not a valid JSON escape; strip the backslash but
+            # preserve a real ``\\'`` (escaped backslash then apostrophe)
+            # by only rewriting ``\'`` after an even number of backslashes.
+            raw = re.sub(r"(?<!\\)((?:\\\\)*)\\'", r"\1'", raw)
+        try:
+            return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise self.exc.AbortExtraction(
                 f"failed to parse SalePageIndexViewModel: {exc}")
