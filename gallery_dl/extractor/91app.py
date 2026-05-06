@@ -308,7 +308,7 @@ class _91appProductExtractor(_91appExtractor):
                 continue
             for tag in text.extract_iter(html, "<img", ">"):
                 if src := self._extract_src(tag):
-                    if "img.91app.com" in src or src in seen:
+                    if self._is_primary_cdn_url(src) or src in seen:
                         continue
                     seen.add(src)
                     out.append((src, f"img:{fld}"))
@@ -322,7 +322,7 @@ class _91appProductExtractor(_91appExtractor):
         if body_html:
             for tag in text.extract_iter(body_html, "<img", ">"):
                 if src := self._extract_src(tag):
-                    if "img.91app.com" in src or src in seen:
+                    if self._is_primary_cdn_url(src) or src in seen:
                         continue
                     seen.add(src)
                     out.append((src, "img:body"))
@@ -334,6 +334,18 @@ class _91appProductExtractor(_91appExtractor):
                     out.append((src, "iframe:body"))
 
         return out
+
+    @staticmethod
+    def _is_primary_cdn_url(url):
+        """True if URL is one of the SalePage primary ImageList paths.
+
+        Used to avoid double-counting ImageList images that also appear
+        in body markup.  ``img.91app.com`` also serves SalePageDesc
+        rich-body images (``/webapi/images/r/SalePageDesc/...``) which
+        are *not* ImageList duplicates and must be kept; the path
+        prefix ``/imagesV3/Original/SalePage/`` is unique to ImageList.
+        """
+        return "/imagesV3/Original/SalePage/" in url
 
     @staticmethod
     def _extract_src(tag):
