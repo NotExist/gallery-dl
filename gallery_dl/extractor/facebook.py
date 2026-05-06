@@ -1078,6 +1078,18 @@ class FacebookVideoExtractor(FacebookExtractor):
         if "url" not in video:
             return
 
+        # FB serves a recommendation/landing page (with another video's
+        # metadata) when a video ID is deleted, private, or otherwise
+        # unreachable. Reject responses whose extracted id does not
+        # match the requested one to avoid downloading the wrong video.
+        extracted_id = video.get("id") or ""
+        if extracted_id != video_id:
+            self.log.warning(
+                "Video ID mismatch (requested %s, got %s) — "
+                "page may be redirected (deleted/private?)",
+                video_id, extracted_id or "<empty>")
+            return
+
         self._decode_metadata(video)
         self._decode_metadata(audio)
         yield Message.Directory, "", video
