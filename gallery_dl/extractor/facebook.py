@@ -825,7 +825,7 @@ class FacebookPostExtractor(FacebookExtractor):
         # the same directory when users customise directory_fmt).
         photo_data = None
         if not own_token:
-            photo_data = self._resolve_single_photo(post_page)
+            photo_data = self._resolve_single_photo(post_page, post_id)
             if photo_data:
                 directory["set_id"] = photo_data.get("set_id", "")
                 directory["title"] = photo_data.get("title", "")
@@ -889,16 +889,34 @@ class FacebookPostExtractor(FacebookExtractor):
         self._detect_jump = False
         yield from self.extract_set(set_data)
 
-    def _resolve_single_photo(self, post_page):
+    def _resolve_single_photo(self, post_page, post_id):
         """Fetch the single photo and its parent album metadata.
 
         Returns a photo dict with set_id, title, url, id, etc.
         populated, or None if extraction fails.  Does NOT yield —
         the caller handles Directory/Url emission so that JSON
         content and the photo share the same directory context.
+
+        Anchored on the first occurrence of `post_id` (stable
+        numeric id from creation_story decode): scans back for
+        the nearest '"__isMedia":"Photo"' block.  FB occasionally
+        renders sidebar/related photo nodes before the post's own
+        photo, so taking the literal first block misfires ~20%
+        of the time on some posts.
         """
-        media_block = text.extr(
-            post_page, '"__isMedia":"Photo"', '"target_group"')
+        media_block = ""
+        pid_pos = post_page.find(post_id) if post_id else -1
+        if pid_pos > 0:
+            anchor = '"__isMedia":"Photo"'
+            media_pos = post_page.rfind(anchor, 0, pid_pos)
+            if media_pos >= 0:
+                head = media_pos + len(anchor)
+                end = post_page.find('"target_group"', head)
+                media_block = post_page[head:end] if end > 0 \
+                    else post_page[head:head + 5000]
+        if not media_block:
+            media_block = text.extr(
+                post_page, '"__isMedia":"Photo"', '"target_group"')
         first_photo_url = (
             text.extr(media_block, '"url":"', ',')
             if media_block else "")
