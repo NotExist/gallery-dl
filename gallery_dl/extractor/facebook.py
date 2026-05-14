@@ -897,23 +897,37 @@ class FacebookPostExtractor(FacebookExtractor):
         the caller handles Directory/Url emission so that JSON
         content and the photo share the same directory context.
 
-        Anchored on the first occurrence of `post_id` (stable
-        numeric id from creation_story decode): scans back for
-        the nearest '"__isMedia":"Photo"' block.  FB occasionally
-        renders sidebar/related photo nodes before the post's own
-        photo, so taking the literal first block misfires ~20%
-        of the time on some posts.
+        Identifies the post's own '"__isMedia":"Photo"' block by
+        validating each candidate block's creation_story.id (base64
+        of 'S:_I<uid>:<post_id>:<post_id>') decodes to the post_id
+        we already extracted.  FB renders sidebar / related photo
+        nodes in the same page; matching on the structural link
+        (rather than DOM position) gives a deterministic pick
+        regardless of SSR ordering drift.
+
+        Falls back to the legacy 'first __isMedia:Photo block'
+        heuristic when no candidate validates.
         """
         media_block = ""
-        pid_pos = post_page.find(post_id) if post_id else -1
-        if pid_pos > 0:
+        if post_id:
             anchor = '"__isMedia":"Photo"'
-            media_pos = post_page.rfind(anchor, 0, pid_pos)
-            if media_pos >= 0:
-                head = media_pos + len(anchor)
-                end = post_page.find('"target_group"', head)
-                media_block = post_page[head:end] if end > 0 \
-                    else post_page[head:head + 5000]
+            for m in re.finditer(re.escape(anchor), post_page):
+                head = m.end()
+                # 8 KB window is enough to reach the b64
+                # creation_story.id at the end of the Photo node.
+                window = post_page[head:head + 8000]
+                cs_id_match = re.search(
+                    r'"creation_story":\{[\s\S]*?'
+                    r'"id":"([A-Za-z0-9+/=]{30,})"', window)
+                if not cs_id_match:
+                    continue
+                _, decoded_post_id = self._decode_creation_story_id(
+                    cs_id_match.group(1))
+                if decoded_post_id == post_id:
+                    end = post_page.find('"target_group"', head)
+                    media_block = post_page[head:end] if end > 0 \
+                        else window
+                    break
         if not media_block:
             media_block = text.extr(
                 post_page, '"__isMedia":"Photo"', '"target_group"')
